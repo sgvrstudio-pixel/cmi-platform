@@ -1,0 +1,17 @@
+# .dockerignore
+.git
+.github
+.devcontainer
+.vscode
+__pycache__
+*.pyc
+*.pyo
+
+# 极其重要：防止巨大的备份文件被 COPY . /app 打包进镜像，导致镜像虚胖
+*.dump
+data/
+mock-data/
+
+# 忽略本地的环境变量和日志
+.env
+*.log

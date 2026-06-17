@@ -1,0 +1,15 @@
+# 忽略 Python 缓存
+__pycache__/
+*.pyc
+
+# 忽略本地虚拟环境
+.venv/
+venv/
+
+# 忽略敏感数据和大型备份
+*.dump
+data/
+.env
+
+# 忽略操作系统垃圾文件
+.DS_Store
