@@ -24,9 +24,8 @@ RUN git clone https://github.com/sgvrstudio-pixel/cmi-platform.git .
 # RUN bash -c "shopt -s extglob && rm -rf ! (src|requirements.txt)"
 
 # 2. 核心修改：先升级 pip，然后直接安装根目录下的 requirements.txt
-#（加入了清华源镜像加速，防止在飞牛 NAS 虚拟机里拉取 Python 包超时）
 RUN pip install --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+    pip install --no-cache-dir -r requirements.txt 
 
 EXPOSE 8501
 
@@ -34,6 +33,6 @@ EXPOSE 8501
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:8501/_stcore/health || exit 1
 
-# 3. 核心修改：根据你的 GitHub 结构，app_v1.py 实际是在 src/ 目录下！
-# 既然克隆到了 /app，那它的相对路径就是 src/app_v1.py
-CMD ["streamlit", "run", "src/app_v1.py", "--server.port=8501", "--server.address=0.0.0.0"]
+# 3. 核心修改：根据你的 GitHub 结构，app_streamlit_pdf_ocr.py 实际是在 src/ 目录下！
+# 既然克隆到了 /app，那它的相对路径就是 src/app_streamlit_pdf_ocr.py
+CMD ["streamlit", "run", "src/app_streamlit_pdf_ocr.py", "--server.port=8501", "--server.address=0.0.0.0"]
