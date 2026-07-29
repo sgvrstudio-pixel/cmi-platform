@@ -33,6 +33,6 @@ EXPOSE 8501
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:8501/_stcore/health || exit 1
 
-# 3. 核心修改：根据你的 GitHub 结构，app_streamlit_pdf_ocr.py 实际是在 src/ 目录下！
-# 既然克隆到了 /app，那它的相对路径就是 src/app_streamlit_pdf_ocr.py
-CMD ["streamlit", "run", "src/app_streamlit_pdf_ocr.py", "--server.port=8501", "--server.address=0.0.0.0"]
+# 3. 核心修改：根据你的 GitHub app_v1.py 实际是在 src/ 目录下！
+# 既然克隆到了 /app，那它的相对路径就是 src/app_v1.py
+CMD ["streamlit", "run", "src/app_v1.py", "--server.port=8501", "--server.address=0.0.0.0"]
