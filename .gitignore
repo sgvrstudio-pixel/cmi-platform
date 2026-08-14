@@ -13,3 +13,6 @@ data/
 
 # 忽略操作系统垃圾文件
 .DS_Store
+
+
+./streamlit/secrets.toml
