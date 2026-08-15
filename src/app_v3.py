@@ -11,16 +11,29 @@ Run:
 Streamlit Cloud:
     Secrets:
         DB_URL="postgresql+psycopg2://USER:PASSWORD@HOST/DB?sslmode=require"
+        DS_OCR2_API_KEY="YOUR_API_KEY"
+        DS_OCR2_API_URL="https://YOUR_PROVIDER/v1/chat/completions"
+        DS_OCR2_MODEL="deepseek-ocr2"
+        # Optional OCR tuning:
+        # DS_OCR2_DPI=220, DS_OCR2_MAX_PAGES=20, DS_OCR2_CONCURRENCY=2
+        # DS_OCR2_MAX_TOKENS=8192, DS_OCR2_TIMEOUT=300, DS_OCR2_RETRIES=2
 """
 
 import os
 import re
 import io
+import json
+import base64
 import hashlib
+import html
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 
 import streamlit as st
 import pandas as pd
+import requests
+import fitz  # PyMuPDF
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
 
@@ -174,6 +187,7 @@ p, label, .stCaption { color: var(--muted) !important; }
   color: rgba(255,255,255,0.7) !important;
 }
 
+
 /* ==================== Hide Streamlit / GitHub / Deploy Icons ==================== */
 
 /* Hide top-right toolbar container */
@@ -244,9 +258,10 @@ button[kind="header"] {
 .block-container {
   padding-top: 1rem !important;
 }
+
+
 """
 st.markdown(f"<style>{THEME_CSS}</style>", unsafe_allow_html=True)
-
 
 
 # ==================== I18N ====================
@@ -615,6 +630,49 @@ if not DB_URL:
 engine = create_engine(DB_URL, pool_pre_ping=True, poolclass=NullPool)
 
 
+def get_secret_or_env(name: str, default=None):
+    value = None
+    try:
+        value = st.secrets.get(name, None)
+    except Exception:
+        value = None
+    if value is None:
+        value = os.getenv(name, default)
+    return value
+
+
+DS_OCR2_API_KEY = get_secret_or_env("DS_OCR2_API_KEY")
+DS_OCR2_API_URL = get_secret_or_env("DS_OCR2_API_URL")
+DS_OCR2_MODEL = get_secret_or_env("DS_OCR2_MODEL", "deepseek-ocr2")
+
+
+def get_int_setting(name: str, default: int, minimum: int, maximum: int) -> int:
+    """读取并限制整数配置，避免错误的环境变量拖垮 OCR 服务。"""
+    try:
+        value = int(get_secret_or_env(name, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+def get_float_setting(name: str, default: float, minimum: float, maximum: float) -> float:
+    try:
+        value = float(get_secret_or_env(name, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+DS_OCR2_DPI = get_int_setting("DS_OCR2_DPI", 220, 120, 360)
+DS_OCR2_MAX_PAGES = get_int_setting("DS_OCR2_MAX_PAGES", 20, 1, 100)
+DS_OCR2_MAX_IMAGE_SIDE = get_int_setting("DS_OCR2_MAX_IMAGE_SIDE", 3200, 1200, 5000)
+DS_OCR2_MAX_TOKENS = get_int_setting("DS_OCR2_MAX_TOKENS", 8192, 1024, 32768)
+DS_OCR2_TIMEOUT = get_int_setting("DS_OCR2_TIMEOUT", 300, 30, 900)
+DS_OCR2_RETRIES = get_int_setting("DS_OCR2_RETRIES", 2, 0, 5)
+DS_OCR2_CONCURRENCY = get_int_setting("DS_OCR2_CONCURRENCY", 2, 1, 6)
+DS_OCR2_RETRY_BACKOFF = get_float_setting("DS_OCR2_RETRY_BACKOFF", 1.5, 0.2, 10.0)
+
+
 # ==================== INIT DB ====================
 with engine.begin() as conn:
     conn.execute(text("""
@@ -630,19 +688,11 @@ with engine.begin() as conn:
     conn.execute(text("""
     CREATE TABLE IF NOT EXISTS quotations (
         id SERIAL PRIMARY KEY,
-        序号 TEXT,
         设备材料名称 TEXT NOT NULL,
         规格或型号 TEXT,
-        描述 TEXT,
         品牌 TEXT,
-        单位 TEXT,
-        数量确认 DOUBLE PRECISION,
-        报价品牌 TEXT,
-        型号 TEXT,
         设备单价 DOUBLE PRECISION,
-        设备小计 DOUBLE PRECISION,
         人工包干单价 DOUBLE PRECISION,
-        人工包干小计 DOUBLE PRECISION,
         综合单价汇总 DOUBLE PRECISION,
         币种 TEXT,
         原厂品牌维保期限 TEXT,
@@ -652,7 +702,6 @@ with engine.begin() as conn:
         项目名称 TEXT,
         供应商名称 TEXT,
         询价日期 TEXT,
-        录入人 TEXT,
         地区 TEXT
     )
     """))
@@ -674,19 +723,11 @@ with engine.begin() as conn:
     CREATE TABLE IF NOT EXISTS deleted_quotations (
         id SERIAL PRIMARY KEY,
         original_id INTEGER,
-        序号 TEXT,
         设备材料名称 TEXT,
         规格或型号 TEXT,
-        描述 TEXT,
         品牌 TEXT,
-        单位 TEXT,
-        数量确认 DOUBLE PRECISION,
-        报价品牌 TEXT,
-        型号 TEXT,
         设备单价 DOUBLE PRECISION,
-        设备小计 DOUBLE PRECISION,
         人工包干单价 DOUBLE PRECISION,
-        人工包干小计 DOUBLE PRECISION,
         综合单价汇总 DOUBLE PRECISION,
         币种 TEXT,
         原厂品牌维保期限 TEXT,
@@ -696,7 +737,6 @@ with engine.begin() as conn:
         项目名称 TEXT,
         供应商名称 TEXT,
         询价日期 TEXT,
-        录入人 TEXT,
         地区 TEXT,
         deleted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         deleted_by TEXT
@@ -729,15 +769,75 @@ HEADER_SYNONYMS = {
 }
 
 DB_COLUMNS = [
-    "序号", "设备材料名称", "规格或型号", "描述", "品牌", "单位", "数量确认",
-    "报价品牌", "型号", "设备单价", "设备小计", "人工包干单价", "人工包干小计",
-    "综合单价汇总", "币种", "原厂品牌维保期限", "货期", "备注",
-    "询价人", "项目名称", "供应商名称", "询价日期", "录入人", "地区"
+    "设备材料名称", "规格或型号", "品牌",
+    "设备单价", "人工包干单价", "综合单价汇总", "币种",
+    "原厂品牌维保期限", "货期", "备注",
+    "询价人", "项目名称", "供应商名称", "询价日期", "地区"
 ]
+
+NUMERIC_COLUMNS = ["设备单价", "人工包干单价", "综合单价汇总"]
 
 REGION_OPTIONS = ["Singapore", "Malaysia", "Thailand", "Indonesia", "Vietnam", "Philippines", "Others"]
 REGION_OPTIONS_ADMIN = ["Singapore", "Malaysia", "Thailand", "Indonesia", "Vietnam", "Philippines", "Others", "All"]
 CURRENCY_OPTIONS = ["IDR", "USD", "RMB", "SGD", "MYR", "THB"]
+
+OCR_MAPPING_COLUMNS = [
+    "Ignore",
+    "设备材料名称",
+    "规格或型号",
+    "品牌",
+    "设备单价",
+    "人工包干单价",
+    "综合单价汇总",
+    "原厂品牌维保期限",
+    "货期",
+    "备注",
+]
+
+OCR_EDITABLE_COLUMNS = [
+    "设备材料名称",
+    "规格或型号",
+    "品牌",
+    "设备单价",
+    "人工包干单价",
+    "综合单价汇总",
+    "原厂品牌维保期限",
+    "货期",
+    "备注",
+]
+
+DS_OCR2_MARKDOWN_PROMPT = """
+<|grounding|>Convert the document to markdown.
+Preserve every quotation line-item table as a Markdown table. Transcribe values exactly as shown.
+Do not calculate, correct, translate, or infer missing text or numbers.
+""".strip()
+
+# 仅当官方 Markdown 输出中存在报价表特征、但表格解析失败时才进行第二次结构化识别。
+DS_OCR2_JSON_FALLBACK_PROMPT = """
+Extract only the quotation line-item table from this page.
+Return one JSON object only, with no Markdown or explanation:
+{
+  "raw_tables": [
+    {
+      "table_name": "quotation_table",
+      "columns": ["original header"],
+      "rows": [{"original header": "exact cell value"}]
+    }
+  ]
+}
+Rules:
+- Preserve original headers and cell text exactly.
+- Keep one object per actual line item.
+- Never include subtotal, discount summary, GST/tax, grand total, terms, signatures, headers, or footers.
+- Never calculate or guess. Use "请核查" only when a visible cell cannot be read.
+- If no line-item table exists, return {"raw_tables": []}.
+""".strip()
+
+OCR_STATE_KEYS = [
+    "ocr_json_raw", "ocr_raw_df_csv", "ocr_ai_mapping_json",
+    "ocr_mapped_csv", "ocr_edited_csv", "ocr_final_csv",
+    "ocr_ready_for_global", "ocr_file_fingerprint",
+]
 
 
 # ==================== SEARCH SYNONYMS ====================
@@ -921,6 +1021,905 @@ def normalize_cell(x):
     return s
 
 
+def normalize_unclear_text(value):
+    """将 OCR 模型常见的不确定表达统一显示为“请核查”。"""
+    if value is None:
+        return ""
+    s = str(value).strip()
+    if not s:
+        return ""
+
+    unclear_tokens = {
+        "unclear", "[unclear]", "unknown", "[unknown]", "n/a", "na",
+        "无法识别", "无法确认", "看不清", "模糊", "不清楚", "不可读", "未识别",
+        "请核查", "请核对", "需核查", "需人工核查"
+    }
+    if s.lower() in unclear_tokens or s in unclear_tokens:
+        return "请核查"
+    return s
+
+
+def render_pdf_pages(
+    pdf_bytes: bytes,
+    dpi: int = DS_OCR2_DPI,
+    max_pages: int = DS_OCR2_MAX_PAGES,
+    max_image_side: int = DS_OCR2_MAX_IMAGE_SIDE,
+):
+    """校验 PDF 并按页自适应渲染；不再静默截断超页数文件。"""
+    if not pdf_bytes or not bytes(pdf_bytes[:5]).startswith(b"%PDF-"):
+        raise ValueError("上传文件不是有效的 PDF。")
+
+    doc = None
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        if doc.needs_pass:
+            raise ValueError("暂不支持加密或需要密码的 PDF。")
+        if len(doc) == 0:
+            raise ValueError("PDF 没有可识别页面。")
+        if len(doc) > max_pages:
+            raise ValueError(f"PDF 共 {len(doc)} 页，超过当前上限 {max_pages} 页。")
+
+        rendered_pages = []
+        requested_zoom = dpi / 72.0
+        for page_index in range(len(doc)):
+            page = doc.load_page(page_index)
+            longest_side = max(float(page.rect.width), float(page.rect.height), 1.0)
+            zoom = min(requested_zoom, max_image_side / longest_side)
+            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+            rendered_pages.append({
+                "page_number": page_index + 1,
+                "image_bytes": pix.tobytes("png"),
+                "width": pix.width,
+                "height": pix.height,
+                "native_text_chars": len(page.get_text("text").strip()),
+            })
+        return rendered_pages
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"PDF 打开或渲染失败：{exc}") from exc
+    finally:
+        if doc is not None:
+            doc.close()
+
+
+def pdf_bytes_to_page_png_bytes(
+    pdf_bytes: bytes,
+    dpi: int = DS_OCR2_DPI,
+    max_pages: int = DS_OCR2_MAX_PAGES,
+):
+    """兼容旧调用：返回 PDF 每页 PNG bytes。"""
+    return [
+        page["image_bytes"]
+        for page in render_pdf_pages(pdf_bytes, dpi=dpi, max_pages=max_pages)
+    ]
+
+
+def extract_json_from_text(text_value: str):
+    """从纯 JSON、代码块或夹杂说明的返回中提取第一个 JSON object。"""
+    if not text_value:
+        raise ValueError("OCR 服务返回空内容。")
+
+    s = str(text_value).strip()
+    s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*```$", "", s)
+
+    try:
+        return json.loads(s)
+    except (TypeError, json.JSONDecodeError):
+        pass
+
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", s):
+        try:
+            parsed, _ = decoder.raw_decode(s[match.start():])
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            continue
+
+    raise ValueError("OCR 返回内容中没有有效的 JSON object。")
+
+
+def normalize_json_values(obj):
+    """递归清理 JSON 中的 OCR 不确定表达。"""
+    if isinstance(obj, dict):
+        return {str(k): normalize_json_values(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [normalize_json_values(v) for v in obj]
+    if obj is None:
+        return None
+    if isinstance(obj, (int, float, bool)):
+        return obj
+    return normalize_unclear_text(obj)
+
+
+def _extract_api_response_content(data):
+    """兼容常见 OpenAI-compatible、代理商和直接结构化返回。"""
+    if not isinstance(data, dict):
+        return data
+    if isinstance(data.get("json"), dict):
+        return data["json"]
+    if isinstance(data.get("result"), dict):
+        result = data["result"]
+        if "raw_tables" in result:
+            return result
+        nested_value = result.get("text") or result.get("content") or result.get("ocr_text")
+        if nested_value is not None:
+            return nested_value
+        return result
+
+    choices = data.get("choices") or []
+    if choices and isinstance(choices[0], dict):
+        choice = choices[0]
+        message = choice.get("message") or {}
+        content = message.get("content") if isinstance(message, dict) else None
+        if content is None:
+            content = choice.get("text")
+        if isinstance(content, dict):
+            if "raw_tables" in content:
+                return content
+            nested_value = content.get("text") or content.get("content") or content.get("ocr_text")
+            if nested_value is not None:
+                return nested_value
+        if isinstance(content, list):
+            text_parts = []
+            for part in content:
+                if isinstance(part, str):
+                    text_parts.append(part)
+                elif isinstance(part, dict):
+                    value = part.get("text") or part.get("content")
+                    if value:
+                        text_parts.append(str(value))
+            return "\n".join(text_parts)
+        if content is not None:
+            return content
+
+    return (
+        data.get("output_text")
+        or data.get("text")
+        or data.get("ocr_text")
+        or data.get("content")
+        or data.get("result")
+        or ""
+    )
+
+
+def request_deepseek_ocr2(image_bytes: bytes, prompt: str, filename: str = "page.png"):
+    """调用 OpenAI-compatible 视觉接口，含限流/服务端错误重试。"""
+    if not DS_OCR2_API_URL:
+        raise ValueError("OCR 服务地址暂未配置，请联系管理员。")
+    if not image_bytes:
+        raise ValueError(f"{filename} 没有可发送的图片内容。")
+
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+    image_data_url = f"data:image/png;base64,{image_b64}"
+    payload = {
+        "model": DS_OCR2_MODEL,
+        "temperature": 0,
+        "max_tokens": DS_OCR2_MAX_TOKENS,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": image_data_url},
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ],
+    }
+    headers = {"Content-Type": "application/json"}
+    if DS_OCR2_API_KEY:
+        headers["Authorization"] = f"Bearer {DS_OCR2_API_KEY}"
+
+    last_error = None
+    for attempt in range(DS_OCR2_RETRIES + 1):
+        try:
+            response = requests.post(
+                DS_OCR2_API_URL,
+                headers=headers,
+                json=payload,
+                timeout=DS_OCR2_TIMEOUT,
+            )
+            if response.status_code == 429 or response.status_code >= 500:
+                detail = re.sub(r"\s+", " ", response.text or "")[:300]
+                raise requests.HTTPError(
+                    f"HTTP {response.status_code}: {detail}", response=response
+                )
+            if response.status_code >= 400:
+                detail = re.sub(r"\s+", " ", response.text or "")[:500]
+                raise ValueError(f"OCR API HTTP {response.status_code}: {detail}")
+            try:
+                data = response.json()
+            except ValueError:
+                data = {"text": response.text}
+            content = _extract_api_response_content(data)
+            if content in (None, ""):
+                raise ValueError("OCR API 返回为空。")
+            return content
+        except ValueError:
+            raise
+        except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as exc:
+            last_error = exc
+            if attempt >= DS_OCR2_RETRIES:
+                break
+            retry_after = 0.0
+            response_obj = getattr(exc, "response", None)
+            if response_obj is not None:
+                try:
+                    retry_after = float(response_obj.headers.get("Retry-After", 0))
+                except (TypeError, ValueError):
+                    retry_after = 0.0
+            wait_seconds = min(30.0, max(retry_after, DS_OCR2_RETRY_BACKOFF * (2 ** attempt)))
+            time.sleep(wait_seconds)
+
+    raise ValueError(f"OCR API 请求失败（已重试）：{last_error}") from last_error
+
+
+def call_deepseek_ocr2_image_api(image_bytes: bytes, filename: str = "page.png"):
+    """兼容旧函数名：执行 DeepSeek-OCR-2 官方 Markdown 识别。"""
+    return request_deepseek_ocr2(
+        image_bytes=image_bytes,
+        prompt=DS_OCR2_MARKDOWN_PROMPT,
+        filename=filename,
+    )
+
+
+def clean_deepseek_markdown(text_value: str) -> str:
+    """移除 DeepSeek grounding 坐标标记，保留可读内容和 Markdown 表格。"""
+    text_value = "" if text_value is None else str(text_value)
+    cleaned = re.sub(r"<\|det\|>.*?<\|/det\|>", "", text_value, flags=re.DOTALL)
+    cleaned = re.sub(r"<\|/?(?:ref|grounding)\|>", "", cleaned)
+    cleaned = re.sub(r"^```(?:markdown|md)?\s*", "", cleaned.strip(), flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    return cleaned.strip()
+
+
+def _clean_markdown_cell(value) -> str:
+    value = html.unescape(str(value or ""))
+    value = re.sub(r"<br\s*/?>", "\n", value, flags=re.IGNORECASE)
+    value = value.replace(r"\|", "|")
+    value = re.sub(r"\[(.*?)\]\([^)]*\)", r"\1", value)
+    value = re.sub(r"(?<!\*)\*\*(.*?)\*\*(?!\*)", r"\1", value)
+    return normalize_unclear_text(value.strip())
+
+
+def _split_markdown_row(line: str):
+    line = line.strip()
+    if line.startswith("|"):
+        line = line[1:]
+    if line.endswith("|") and not line.endswith(r"\|"):
+        line = line[:-1]
+    return [_clean_markdown_cell(cell) for cell in re.split(r"(?<!\\)\|", line)]
+
+
+def _is_markdown_separator(line: str) -> bool:
+    cells = _split_markdown_row(line)
+    return bool(cells) and all(re.fullmatch(r":?-{3,}:?", cell.replace(" ", "")) for cell in cells)
+
+
+def _make_unique_columns(columns):
+    result = []
+    seen = {}
+    for index, column in enumerate(columns, start=1):
+        base = _clean_markdown_cell(column) or f"Column {index}"
+        seen[base] = seen.get(base, 0) + 1
+        result.append(base if seen[base] == 1 else f"{base} ({seen[base]})")
+    return result
+
+
+def infer_ocr_target_from_header(raw_header: str) -> str:
+    """用可审计的本地规则做字段映射，避免为映射再次调用模型。"""
+    header = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", " ", str(raw_header).lower()).strip()
+    compact = header.replace(" ", "")
+
+    if re.search(r"人工.*(单价|价格)|labou?r.*(unit )?(price|rate)", header):
+        return "人工包干单价"
+    if re.search(r"(total|extended|line).*?(amount|price)|金额合计|综合单价|总价|小计", header):
+        return "综合单价汇总"
+    if re.search(r"unit.*(price|rate)|price.*unit|单价", header) or re.fullmatch(
+        r"unit(sgd|usd|rmb|cny|myr|idr|thb)", compact
+    ):
+        return "设备单价"
+    if re.search(r"item.*description|description.*item|product.*description|设备材料名称|设备名称|物料名称|品名", header):
+        return "设备材料名称"
+    if re.search(r"specification|\bspec\b|model|part\s*(no|number)|规格|型号", header):
+        return "规格或型号"
+    if re.search(r"brand|make|manufacturer|品牌|厂商", header):
+        return "品牌"
+    if re.search(r"warranty|maintenance.*(term|period)|维保|保修", header):
+        return "原厂品牌维保期限"
+    if re.search(r"lead\s*time|delivery|availability|货期|交付周期", header):
+        return "货期"
+    if re.search(r"remark|comment|note|备注|说明", header):
+        return "备注"
+    if re.search(r"description|item|product|service|equipment|材料名称", header):
+        return "设备材料名称"
+    if re.fullmatch(r"total(sgd|usd|rmb|cny|myr|idr|thb)", compact):
+        return "综合单价汇总"
+    return "Ignore"
+
+
+def infer_ocr_column_mapping(columns) -> dict:
+    return {str(column): infer_ocr_target_from_header(column) for column in columns}
+
+
+def _is_line_item_table(columns) -> bool:
+    targets = set(infer_ocr_column_mapping(columns).values())
+    has_item = "设备材料名称" in targets
+    has_price = bool(targets.intersection({"设备单价", "人工包干单价", "综合单价汇总"}))
+    return has_item and has_price
+
+
+def _is_summary_or_empty_row(row: dict, columns) -> bool:
+    mapping = infer_ocr_column_mapping(columns)
+    item_columns = [col for col, target in mapping.items() if target == "设备材料名称"]
+    item_text = " ".join(str(row.get(col, "")).strip() for col in item_columns).strip()
+    if not item_text:
+        return True
+    summary_pattern = (
+        r"^(sub\s*total|net\s*subtotal|grand\s*total|total\s*(amount\s*due|payable|due)?|"
+        r"gst|vat|tax|discounts?|sample\s*&?\s*poc\s*discounts?|evaluation\s*waivers?|"
+        r"retail\s*value|original\s*value|合计|小计|总计|税|折扣)\b"
+    )
+    return bool(re.search(summary_pattern, item_text.strip(), flags=re.IGNORECASE))
+
+
+def sanitize_raw_tables(raw_tables) -> list:
+    """规范模型/Markdown 解析结果，并过滤合计栏和非明细表。"""
+    cleaned_tables = []
+    for table_index, table in enumerate(raw_tables or [], start=1):
+        if not isinstance(table, dict):
+            continue
+        rows = table.get("rows") or []
+        if not isinstance(rows, list):
+            continue
+        source_columns = list(table.get("columns") or [])
+        if not source_columns:
+            for row in rows:
+                if isinstance(row, dict):
+                    source_columns.extend(
+                        str(key) for key in row.keys() if str(key) not in source_columns
+                    )
+        columns = _make_unique_columns(source_columns)
+        if not columns or not _is_line_item_table(columns):
+            continue
+
+        normalized_rows = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            normalized = {}
+            for source_column, column in zip(source_columns, columns):
+                value = row.get(source_column, row.get(str(source_column), row.get(column, "")))
+                normalized[column] = normalize_unclear_text(value)
+            if not _is_summary_or_empty_row(normalized, columns):
+                normalized_rows.append(normalized)
+        if normalized_rows:
+            cleaned_tables.append({
+                "table_name": str(table.get("table_name") or f"quotation_table_{table_index}"),
+                "columns": columns,
+                "rows": normalized_rows,
+            })
+    return cleaned_tables
+
+
+def _parse_deepseek_flat_tables(markdown_text: str) -> list:
+    """
+    解析部分 OpenAI-compatible 后端返回的 DeepSeek 定位格式。
+
+    这类返回看似 HTML，但整张表被压成一个文本节点，没有 tr/td 分隔，例如：
+    <table>#ITEM...QTYUNIT PRICE...1Router11,200.00100%0.00...</table>
+    """
+    parsed_tables = []
+    table_blocks = re.findall(
+        r"<table(?:\s[^>]*)?>(.*?)</table>",
+        markdown_text or "",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    header_pattern = re.compile(
+        r"(?P<item>ITEM\s*(?:&\s*)?DESCRIPTION"
+        r"(?:\s*&\s*TECHNICAL\s+SPECIFICATIONS?)?"
+        r"|PRODUCT\s*(?:&\s*)?DESCRIPTION"
+        r"|EQUIPMENT\s*(?:&\s*)?DESCRIPTION)"
+        r"\s*(?P<qty>QTY|QUANTITY)"
+        r"\s*(?P<unit>UNIT\s*(?:PRICE|RATE)?\s*(?:\([A-Z]{3}\))?)"
+        r"\s*(?:(?P<discount>DISCOUNT|DISC\.?))?"
+        r"\s*(?P<total>TOTAL(?:\s*AMOUNT)?\s*(?:\([A-Z]{3}\))?)",
+        flags=re.IGNORECASE,
+    )
+    money_pattern = r"(?:[A-Z]{3}\s*)?[-+]?\$?\s*\d[\d,]*\.\d{2}"
+
+    for block in table_blocks:
+        # 标准 HTML 表格交给 lxml 解析，避免重复或错误拆分。
+        if re.search(r"<tr\b", block, flags=re.IGNORECASE):
+            continue
+
+        decoded_block = html.unescape(block)
+        plain_block = re.sub(r"<br\s*/?>", "\n", decoded_block, flags=re.IGNORECASE)
+        plain_block = re.sub(r"<[^>]+>", " ", plain_block)
+        header_match = header_pattern.search(plain_block)
+        if not header_match:
+            continue
+
+        header_prefix = plain_block[:header_match.start()]
+        has_index = "#" in header_prefix[-10:]
+        body = plain_block[header_match.end():]
+
+        # colspan 后通常是 subtotal/GST/total 汇总，不属于报价明细。
+        summary_marker = re.search(
+            r"(?:sub\s*total|net\s*subtotal|grand\s*total|total\s*(?:amount\s*due|payable)|"
+            r"retail\s*value|evaluation\s*waivers?|gst\s*\(|vat\s*\()",
+            body,
+            flags=re.IGNORECASE,
+        )
+        if summary_marker:
+            body = body[:summary_marker.start()]
+
+        if header_match.group("discount"):
+            suffix_pattern = re.compile(
+                rf"(?P<qty>\d{{1,4}}?)\s*"
+                rf"(?P<unit>{money_pattern})\s*"
+                rf"(?P<discount>\d{{1,3}}(?:\.\d+)?%)\s*"
+                rf"(?P<reason>\([^)]*\))?\s*"
+                rf"(?P<total>{money_pattern})",
+                flags=re.IGNORECASE,
+            )
+        else:
+            suffix_pattern = re.compile(
+                rf"(?P<qty>\d{{1,4}}?)\s*"
+                rf"(?P<unit>{money_pattern})\s*"
+                rf"(?P<total>{money_pattern})",
+                flags=re.IGNORECASE,
+            )
+
+        raw_columns = []
+        if has_index:
+            raw_columns.append("#")
+        raw_columns.extend([
+            _clean_markdown_cell(header_match.group("item")),
+            _clean_markdown_cell(header_match.group("qty")),
+            _clean_markdown_cell(header_match.group("unit")),
+        ])
+        if header_match.group("discount"):
+            raw_columns.append(_clean_markdown_cell(header_match.group("discount")))
+        raw_columns.append(_clean_markdown_cell(header_match.group("total")))
+
+        rows = []
+        cursor = 0
+        expected_index = 1
+        for suffix_match in suffix_pattern.finditer(body):
+            description = body[cursor:suffix_match.start()].strip()
+            cursor = suffix_match.end()
+            if not description:
+                continue
+
+            row = {}
+            if has_index:
+                expected_text = str(expected_index)
+                if description.startswith(expected_text):
+                    row["#"] = expected_text
+                    description = description[len(expected_text):].lstrip()
+                else:
+                    index_match = re.match(r"(\d{1,4}?)(?=[A-Za-z])", description)
+                    if not index_match:
+                        continue
+                    row["#"] = index_match.group(1)
+                    description = description[index_match.end():].lstrip()
+
+            description = re.sub(r"[ \t]+", " ", description)
+            description = re.sub(r"\s*\n\s*", "\n", description).strip()
+            if not description:
+                continue
+
+            row[raw_columns[1 if has_index else 0]] = description
+            row[header_match.group("qty")] = suffix_match.group("qty").strip()
+            row[header_match.group("unit")] = suffix_match.group("unit").strip()
+            if header_match.group("discount"):
+                discount_value = suffix_match.group("discount").strip()
+                reason = (suffix_match.group("reason") or "").strip()
+                row[header_match.group("discount")] = " ".join(
+                    value for value in [discount_value, reason] if value
+                )
+            row[header_match.group("total")] = suffix_match.group("total").strip()
+            rows.append(row)
+            expected_index += 1
+
+        if rows:
+            parsed_tables.append({
+                "table_name": f"quotation_table_{len(parsed_tables) + 1}",
+                "columns": raw_columns,
+                "rows": rows,
+            })
+    return parsed_tables
+
+
+def _parse_html_tables_preserving_text(html_text: str) -> list:
+    """优先直接读取 HTML 单元格，避免 read_html 把 3,200.00 改成 3200.0。"""
+    tables = []
+    try:
+        from lxml import html as lxml_html
+
+        root = lxml_html.fromstring(f"<div>{html_text}</div>")
+        for table_node in root.xpath(".//table"):
+            parsed_rows = []
+            header_index = None
+            for row_index, row_node in enumerate(table_node.xpath(".//tr")):
+                cell_nodes = row_node.xpath("./th|./td")
+                if not cell_nodes:
+                    continue
+                values = []
+                has_header_cell = False
+                for cell_node in cell_nodes:
+                    has_header_cell = has_header_cell or cell_node.tag.lower() == "th"
+                    cell_text = " ".join(part.strip() for part in cell_node.itertext() if part.strip())
+                    colspan = max(1, int(cell_node.get("colspan") or 1))
+                    values.extend([cell_text] + [""] * (colspan - 1))
+                if has_header_cell and header_index is None:
+                    header_index = len(parsed_rows)
+                parsed_rows.append(values)
+
+            if not parsed_rows:
+                continue
+            if header_index is None:
+                header_index = 0
+            columns = _make_unique_columns(parsed_rows[header_index])
+            rows = []
+            for values in parsed_rows[header_index + 1:]:
+                if len(values) < len(columns):
+                    values.extend([""] * (len(columns) - len(values)))
+                elif len(values) > len(columns):
+                    values = values[:len(columns) - 1] + [" ".join(values[len(columns) - 1:])]
+                rows.append({
+                    column: normalize_unclear_text(value)
+                    for column, value in zip(columns, values)
+                })
+            tables.append({
+                "table_name": f"quotation_table_{len(tables) + 1}",
+                "columns": columns,
+                "rows": rows,
+            })
+        return tables
+    except (ImportError, ValueError, TypeError):
+        pass
+
+    try:
+        html_frames = pd.read_html(io.StringIO(html_text), flavor="lxml", keep_default_na=False)
+    except (ValueError, ImportError):
+        return []
+    for frame in html_frames:
+        if isinstance(frame.columns, pd.MultiIndex):
+            raw_columns = []
+            for levels in frame.columns:
+                parts = [
+                    str(level).strip()
+                    for level in levels
+                    if str(level).strip() and not str(level).startswith("Unnamed:")
+                ]
+                raw_columns.append(" ".join(dict.fromkeys(parts)))
+        else:
+            raw_columns = [str(column) for column in frame.columns]
+        columns = _make_unique_columns(raw_columns)
+        rows = []
+        for values in frame.astype(object).where(pd.notnull(frame), "").itertuples(index=False, name=None):
+            rows.append({
+                column: normalize_unclear_text(value)
+                for column, value in zip(columns, values)
+            })
+        tables.append({
+            "table_name": f"quotation_table_{len(tables) + 1}",
+            "columns": columns,
+            "rows": rows,
+        })
+    return tables
+
+
+def parse_markdown_tables(markdown_text: str) -> list:
+    """解析 DeepSeek-OCR-2 常见 Markdown pipe table，并兼容 HTML table。"""
+    cleaned_markdown = clean_deepseek_markdown(markdown_text)
+    lines = cleaned_markdown.splitlines()
+    tables = []
+    index = 0
+    while index + 1 < len(lines):
+        header_line = lines[index]
+        if "|" not in header_line or not _is_markdown_separator(lines[index + 1]):
+            index += 1
+            continue
+
+        columns = _make_unique_columns(_split_markdown_row(header_line))
+        rows = []
+        index += 2
+        while index < len(lines):
+            line = lines[index]
+            if not line.strip() or "|" not in line:
+                break
+            cells = _split_markdown_row(line)
+            if _is_markdown_separator(line):
+                index += 1
+                continue
+            if len(cells) < len(columns):
+                cells.extend([""] * (len(columns) - len(cells)))
+            elif len(cells) > len(columns):
+                cells = cells[:len(columns) - 1] + [" | ".join(cells[len(columns) - 1:])]
+            rows.append(dict(zip(columns, cells)))
+            index += 1
+        tables.append({
+            "table_name": f"quotation_table_{len(tables) + 1}",
+            "columns": columns,
+            "rows": rows,
+        })
+        index += 1
+
+    if not tables and re.search(r"<table\b", cleaned_markdown, flags=re.IGNORECASE):
+        tables.extend(_parse_deepseek_flat_tables(cleaned_markdown))
+        if not tables:
+            tables.extend(_parse_html_tables_preserving_text(cleaned_markdown))
+    return sanitize_raw_tables(tables)
+
+
+def _page_has_line_item_signals(text_value: str) -> bool:
+    normalized = clean_deepseek_markdown(text_value)
+    normalized = re.sub(r"<[^>]+>", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).lower()
+    has_item = bool(re.search(r"item|description|product|equipment|设备|品名", normalized))
+    # 部分后端会把 SPECIFICATIONS/QTY/UNIT 连成 SPECIFICATIONSQTYUNIT。
+    has_quantity = bool(re.search(r"qty|quantity|数量", normalized))
+    has_price = bool(re.search(r"unit\s*(price|\((sgd|usd|rmb|cny|myr|idr|thb)\))|单价", normalized))
+    return has_item and has_quantity and has_price
+
+
+def recognize_deepseek_ocr2_page(page_info: dict, filename: str) -> dict:
+    page_number = int(page_info["page_number"])
+    page_filename = f"{filename}_page_{page_number}.png"
+    response_content = call_deepseek_ocr2_image_api(
+        page_info["image_bytes"], filename=page_filename
+    )
+
+    if isinstance(response_content, dict):
+        raw_tables = sanitize_raw_tables(response_content.get("raw_tables", []))
+        markdown_text = ""
+        recognition_mode = "structured_response"
+    else:
+        markdown_text = clean_deepseek_markdown(response_content)
+        raw_tables = parse_markdown_tables(markdown_text)
+        is_flat_grounded_table = bool(
+            raw_tables
+            and re.search(r"table\[\[.*?\]\]\s*<table", markdown_text, flags=re.IGNORECASE | re.DOTALL)
+            and not re.search(r"<tr\b", markdown_text, flags=re.IGNORECASE)
+        )
+        recognition_mode = "grounded_flat_table" if is_flat_grounded_table else "markdown"
+
+    warnings = []
+    if not raw_tables and markdown_text and _page_has_line_item_signals(markdown_text):
+        fallback_content = request_deepseek_ocr2(
+            page_info["image_bytes"],
+            prompt=DS_OCR2_JSON_FALLBACK_PROMPT,
+            filename=page_filename,
+        )
+        try:
+            fallback_json = (
+                fallback_content
+                if isinstance(fallback_content, dict)
+                else extract_json_from_text(fallback_content)
+            )
+            raw_tables = sanitize_raw_tables(fallback_json.get("raw_tables", []))
+            recognition_mode = "json_fallback"
+        except (ValueError, AttributeError) as exc:
+            warnings.append(f"第 {page_number} 页结构化回退解析失败：{exc}")
+
+    columns = []
+    for table in raw_tables:
+        columns.extend(col for col in table.get("columns", []) if col not in columns)
+
+    return {
+        "page_number": page_number,
+        "raw_tables": raw_tables,
+        "column_mapping": infer_ocr_column_mapping(columns),
+        "mapped_tables": [],
+        "ocr_markdown": markdown_text,
+        "recognition_mode": recognition_mode,
+        "image_size": [page_info["width"], page_info["height"]],
+        "native_text_chars": page_info["native_text_chars"],
+        "warnings": warnings,
+    }
+
+
+def merge_ds_ocr2_page_json(page_json_list):
+    """合并多页 DeepSeek-OCR2 输出。"""
+    merged = {
+        "raw_tables": [],
+        "column_mapping": {},
+        "mapped_tables": [],
+        "pages": [],
+        "warnings": [],
+    }
+
+    for page_idx, obj in enumerate(page_json_list, start=1):
+        if not isinstance(obj, dict):
+            continue
+        actual_page = int(obj.get("page_number") or page_idx)
+
+        for table in obj.get("raw_tables", []) or []:
+            if isinstance(table, dict):
+                table = table.copy()
+                table["page"] = actual_page
+                merged["raw_tables"].append(table)
+
+        for raw_col, target_col in (obj.get("column_mapping", {}) or {}).items():
+            if raw_col not in merged["column_mapping"]:
+                merged["column_mapping"][raw_col] = target_col
+
+        for table in obj.get("mapped_tables", []) or []:
+            if isinstance(table, dict):
+                table = table.copy()
+                table["page"] = actual_page
+                merged["mapped_tables"].append(table)
+
+        merged["pages"].append({
+            "page": actual_page,
+            "recognition_mode": obj.get("recognition_mode", "unknown"),
+            "image_size": obj.get("image_size", []),
+            "native_text_chars": obj.get("native_text_chars", 0),
+            "table_count": len(obj.get("raw_tables", []) or []),
+            "ocr_markdown": obj.get("ocr_markdown", ""),
+        })
+        merged["warnings"].extend(obj.get("warnings", []) or [])
+
+    return merged
+
+
+def call_ds_ocr2_for_pdf(pdf_bytes: bytes, filename: str, progress_callback=None):
+    """并发执行逐页 OCR；单页失败时保留其他页结果并返回明确警告。"""
+    rendered_pages = render_pdf_pages(pdf_bytes)
+    total_pages = len(rendered_pages)
+    page_results = {}
+    page_errors = {}
+    worker_count = min(DS_OCR2_CONCURRENCY, total_pages)
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = {
+            executor.submit(recognize_deepseek_ocr2_page, page, filename): page["page_number"]
+            for page in rendered_pages
+        }
+        completed = 0
+        for future in as_completed(futures):
+            page_number = futures[future]
+            try:
+                page_results[page_number] = future.result()
+            except Exception as exc:
+                page_errors[page_number] = str(exc)
+            completed += 1
+            if progress_callback:
+                progress_callback(completed, total_pages, page_number, page_errors.get(page_number))
+
+    if not page_results:
+        details = "；".join(f"第 {page} 页：{error}" for page, error in sorted(page_errors.items()))
+        raise ValueError(f"所有页面 OCR 均失败。{details}")
+
+    ordered_results = [page_results[page] for page in sorted(page_results)]
+    merged = merge_ds_ocr2_page_json(ordered_results)
+    for page, error in sorted(page_errors.items()):
+        merged["warnings"].append(f"第 {page} 页识别失败：{error}")
+    merged["source_file"] = filename
+    merged["page_count"] = total_pages
+    merged["successful_pages"] = len(page_results)
+    return merged
+
+
+def raw_tables_to_dataframe(ocr_json: dict) -> pd.DataFrame:
+    """将 raw_tables 合并为一个可供人工映射的 DataFrame。"""
+    raw_tables = ocr_json.get("raw_tables", []) if isinstance(ocr_json, dict) else []
+    dfs = []
+
+    for t_idx, table in enumerate(raw_tables, start=1):
+        if not isinstance(table, dict):
+            continue
+        columns = table.get("columns") or []
+        rows = table.get("rows") or []
+        if not isinstance(rows, list):
+            continue
+
+        clean_rows = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            clean_row = {}
+            for col in columns:
+                clean_row[str(col)] = normalize_unclear_text(row.get(col, ""))
+            # 兼容模型漏写 columns 但 rows 里有键的情况
+            for k, v in row.items():
+                if str(k) not in clean_row:
+                    clean_row[str(k)] = normalize_unclear_text(v)
+            clean_rows.append(clean_row)
+
+        if clean_rows:
+            df = pd.DataFrame(clean_rows)
+            df.insert(0, "来源页", table.get("page", ""))
+            df.insert(1, "来源表", table.get("table_name", f"table_{t_idx}"))
+            dfs.append(df)
+
+    if not dfs:
+        return pd.DataFrame()
+
+    return pd.concat(dfs, ignore_index=True, sort=False).fillna("")
+
+
+def get_ai_column_mapping(ocr_json: dict) -> dict:
+    mapping = ocr_json.get("column_mapping", {}) if isinstance(ocr_json, dict) else {}
+    if not isinstance(mapping, dict):
+        return {}
+
+    cleaned = {}
+    for raw_col, target_col in mapping.items():
+        raw_col = str(raw_col)
+        target_col = str(target_col).strip() if target_col is not None else "Ignore"
+        if target_col not in OCR_MAPPING_COLUMNS:
+            target_col = "Ignore"
+        cleaned[raw_col] = target_col
+    return cleaned
+
+
+def apply_column_mapping_to_raw_df(raw_df: pd.DataFrame, mapped_choices: dict) -> pd.DataFrame:
+    """根据用户确认后的 mapping，生成可人工编辑的数据库字段表。"""
+    if raw_df is None or raw_df.empty:
+        return pd.DataFrame(columns=OCR_EDITABLE_COLUMNS)
+
+    result = pd.DataFrame()
+    for raw_col, target_col in mapped_choices.items():
+        if target_col == "Ignore":
+            continue
+        if raw_col not in raw_df.columns:
+            continue
+        if target_col not in OCR_EDITABLE_COLUMNS:
+            continue
+
+        # 如果多个 OCR 列映射到同一个目标字段，优先保留已有非空值，用空值补充。
+        source_ser = raw_df[raw_col].map(normalize_unclear_text)
+        if target_col not in result.columns:
+            result[target_col] = source_ser
+        else:
+            mask = result[target_col].map(normalize_cell).isna()
+            result.loc[mask, target_col] = source_ser.loc[mask]
+
+    for col in OCR_EDITABLE_COLUMNS:
+        if col not in result.columns:
+            result[col] = ""
+
+    result = result[OCR_EDITABLE_COLUMNS]
+    for col in NUMERIC_COLUMNS:
+        if col in result.columns:
+            result[col] = result[col].astype(str).str.replace(",", "", regex=False).str.replace(" ", "", regex=False)
+
+    return result
+
+
+def validate_quotation_df(df: pd.DataFrame):
+    if df is None or df.empty:
+        return pd.DataFrame(columns=DB_COLUMNS), pd.DataFrame(columns=DB_COLUMNS)
+
+    df2 = df.copy()
+    for col in DB_COLUMNS:
+        if col not in df2.columns:
+            df2[col] = pd.NA
+    df2 = df2[DB_COLUMNS]
+
+    required_nonprice = ["项目名称", "供应商名称", "询价人", "币种", "询价日期", "设备材料名称"]
+    missing_required = df2[required_nonprice].map(normalize_cell).isna().any(axis=1)
+
+    def price_has_value(row):
+        return normalize_cell(row.get("设备单价")) is not None or normalize_cell(row.get("人工包干单价")) is not None or normalize_cell(row.get("综合单价汇总")) is not None
+
+    price_mask = df2.apply(price_has_value, axis=1)
+    invalid_mask = missing_required | (~price_mask)
+
+    df_valid = df2[~invalid_mask].copy()
+    df_invalid = df2[invalid_mask].copy()
+    return df_valid, df_invalid
+
+
 # ==================== AUTH ====================
 def login_form():
     ui_card(t("login_system"), t("login_sub"))
@@ -1023,249 +2022,249 @@ with nav_tabs[0]:
     ui_card(t("input_center"), t("input_center_sub"))
     ui_hr()
 
-    st.header(t("excel_bulk"))
-    st.caption(t("excel_caption"))
+    st.header("📄 PDF 报价单 OCR 录入")
+    st.caption("上传 PDF 报价文件，系统会调用 DeepSeek-OCR2 服务识别为原始表格，并给出 AI 推荐字段映射。最终入库前必须人工确认。")
 
-    template = pd.DataFrame(columns=[c for c in DB_COLUMNS if c not in ("录入人", "地区")])
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        template.to_excel(writer, index=False)
-    buf.seek(0)
-    st.download_button(t("download_template"), buf, "quotation_template.xlsx", key="download_template")
+    uploaded_pdf = st.file_uploader("上传 PDF 报价文件", type=["pdf"], key="upload_pdf_ocr")
 
-    uploaded = st.file_uploader(t("upload_excel"), type=["xlsx"], key="upload_excel")
+    if uploaded_pdf:
+        uploaded_pdf_bytes = uploaded_pdf.getvalue()
+        uploaded_pdf_fingerprint = hashlib.sha256(uploaded_pdf_bytes).hexdigest()
+        if st.session_state.get("ocr_file_fingerprint") != uploaded_pdf_fingerprint:
+            for state_key in OCR_STATE_KEYS:
+                st.session_state.pop(state_key, None)
+            st.session_state["ocr_file_fingerprint"] = uploaded_pdf_fingerprint
 
-    if uploaded:
-        if "mapping_done" not in st.session_state:
-            st.session_state["mapping_done"] = False
-        if "bulk_applied" not in st.session_state:
-            st.session_state["bulk_applied"] = False
+        st.info(f"已上传：{uploaded_pdf.name}")
+
+        col_ocr_1, col_ocr_2 = st.columns([1, 4])
+        run_ocr = col_ocr_1.button("开始 OCR 识别", key="run_pdf_ocr")
+        col_ocr_2.caption("逐页识别并自动重试临时错误；结果不会直接入库。")
+
+        if run_ocr:
+            for state_key in OCR_STATE_KEYS:
+                if state_key != "ocr_file_fingerprint":
+                    st.session_state.pop(state_key, None)
+            progress_bar = st.progress(0.0)
+            progress_status = st.empty()
+
+            def update_ocr_progress(completed, total, page_number, page_error):
+                progress_bar.progress(completed / max(total, 1))
+                if page_error:
+                    progress_status.warning(f"第 {page_number} 页失败，继续处理其他页面……")
+                else:
+                    progress_status.caption(f"已完成 {completed}/{total} 页（刚完成第 {page_number} 页）")
+
+            try:
+                with st.spinner("正在调用 DeepSeek-OCR2 识别 PDF，请稍候..."):
+                    ocr_json = call_ds_ocr2_for_pdf(
+                        uploaded_pdf_bytes,
+                        uploaded_pdf.name,
+                        progress_callback=update_ocr_progress,
+                    )
+                    raw_df = raw_tables_to_dataframe(ocr_json)
+                    ai_mapping = get_ai_column_mapping(ocr_json)
+                    st.session_state["ocr_json_raw"] = json.dumps(ocr_json, ensure_ascii=False, indent=2)
+
+                    if raw_df.empty:
+                        st.warning("OCR 已完成，但没有识别到符合规则的报价明细表。请检查原始识别内容或 PDF 清晰度。")
+                    else:
+                        st.session_state["ocr_raw_df_csv"] = raw_df.to_csv(index=False)
+                        st.session_state["ocr_ai_mapping_json"] = json.dumps(ai_mapping, ensure_ascii=False)
+                        st.session_state.pop("ocr_mapped_csv", None)
+                        st.session_state.pop("ocr_edited_csv", None)
+                        st.session_state.pop("ocr_final_csv", None)
+                        st.session_state["ocr_ready_for_global"] = False
+                        st.success("OCR 识别完成，请先检查原始表格和 AI 推荐字段映射。")
+                    for warning_message in ocr_json.get("warnings", []):
+                        st.warning(warning_message)
+            except Exception as e:
+                st.error(f"OCR 识别失败：{e}")
+            finally:
+                progress_bar.empty()
+                progress_status.empty()
+
+    if st.session_state.get("ocr_json_raw"):
+        with st.expander("查看 DeepSeek-OCR2 原始 JSON", expanded=False):
+            st.code(st.session_state["ocr_json_raw"], language="json")
+
+    if st.session_state.get("ocr_raw_df_csv"):
+        try:
+            raw_df = pd.read_csv(io.StringIO(st.session_state["ocr_raw_df_csv"]), dtype=object).fillna("")
+        except Exception as e:
+            st.error(f"恢复 OCR 原始表格失败：{e}")
+            raw_df = pd.DataFrame()
 
         try:
-            preview = pd.read_excel(uploaded, header=None, nrows=50, dtype=object)
-            safe_st_dataframe(preview.head(10), height=320)
-        except Exception as e:
-            st.error(t("preview_fail").format(e))
-            preview = None
+            ai_mapping = json.loads(st.session_state.get("ocr_ai_mapping_json", "{}"))
+        except Exception:
+            ai_mapping = {}
 
-        if preview is not None:
-            header_names, header_row_index = detect_header_from_preview(preview, max_header_rows=2, max_search_rows=8)
-            raw_df_full = pd.read_excel(uploaded, header=None, dtype=object)
+        if not raw_df.empty:
+            st.markdown("### 1. OCR 原始识别表格")
+            st.caption("这里显示 DeepSeek-OCR2 识别出的原始表头和原始内容。看不清的内容会显示为：请核查。")
+            safe_st_dataframe(raw_df, height=360)
 
-            if header_names is None:
-                header_row_index = 0
-                header_names = [str(x) if not pd.isna(x) else "" for x in raw_df_full.iloc[0].tolist()]
-
-            data_df = raw_df_full.iloc[header_row_index + 1:].copy().reset_index(drop=True)
-
-            if len(header_names) < data_df.shape[1]:
-                header_names += [f"Unnamed_{i}" for i in range(len(header_names), data_df.shape[1])]
-            elif len(header_names) > data_df.shape[1]:
-                header_names = header_names[:data_df.shape[1]]
-
-            data_df.columns = header_names
-
-            st.markdown(f"**{t('raw_headers_detected')}**")
-            st.write(list(data_df.columns))
-
-            mapping_targets = [t("ignore")] + [c for c in DB_COLUMNS if c not in ("录入人", "地区")]
-
-            auto_defaults = {}
-            for col in data_df.columns:
-                auto_val = auto_map_header(col)
-                auto_defaults[col] = auto_val if (auto_val and auto_val in mapping_targets) else t("ignore")
-
-            st.markdown(t("mapping_suggested"))
+            st.markdown("### 2. AI 推荐字段映射，可人工修改")
+            st.caption("AI 会先自动猜测每个 OCR column 对应哪个数据库字段。如果不对，可以手动改。")
 
             mapped_choices = {}
-            with st.form("mapping_form", clear_on_submit=False):
+            with st.form("ocr_ai_mapping_form", clear_on_submit=False):
                 cols_left, cols_right = st.columns(2)
-                for i, col in enumerate(data_df.columns):
-                    default = auto_defaults.get(col, t("ignore"))
-                    container = cols_left if i % 2 == 0 else cols_right
-                    sel = container.selectbox(
-                        t("source_col").format(col),
-                        mapping_targets,
-                        index=mapping_targets.index(default) if default in mapping_targets else 0,
-                        key=f"map_{i}"
-                    )
-                    mapped_choices[col] = sel
-                submitted = st.form_submit_button(t("apply_mapping_preview"))
-
-            if submitted:
-                rename_dict = {orig: mapped for orig, mapped in mapped_choices.items() if mapped != t("ignore")}
-                df_mapped = data_df.rename(columns=rename_dict).copy()
-
-                for c in DB_COLUMNS:
-                    if c not in df_mapped.columns:
-                        df_mapped[c] = pd.NA
-
-                df_mapped["录入人"] = user["username"]
-                df_mapped["地区"] = user["region"]
-                df_for_db = df_mapped[DB_COLUMNS]
-
-                csv_buf = io.StringIO()
-                df_for_db.to_csv(csv_buf, index=False)
-                st.session_state["mapping_csv"] = csv_buf.getvalue()
-                st.session_state["mapping_done"] = True
-
-                st.success(t("mapping_saved"))
-
-    mapping_csv = st.session_state.get("mapping_csv", None)
-    if mapping_csv:
-        try:
-            df_for_db = pd.read_csv(io.StringIO(mapping_csv), dtype=object)
-            for c in DB_COLUMNS:
-                if c not in df_for_db.columns:
-                    df_for_db[c] = pd.NA
-            df_for_db = df_for_db[DB_COLUMNS]
-        except Exception as e:
-            st.error(t("mapping_restore_fail").format(e))
-            df_for_db = None
-
-        st.markdown(f"**{t('mapped_preview')}**")
-        if df_for_db is not None:
-            safe_st_dataframe(df_for_db.head(10), height=320)
-        else:
-            st.info(t("mapping_unavailable"))
-
-        if "show_global_form" not in st.session_state:
-            st.session_state["show_global_form"] = False
-
-        col_show, col_hint = st.columns([1, 6])
-        if col_show.button(t("open_global_form"), key="open_global_form_btn"):
-            st.session_state["show_global_form"] = True
-        col_hint.caption(t("global_hint"))
-
-        if st.session_state["show_global_form"]:
-            if "bulk_values" not in st.session_state:
-                st.session_state["bulk_values"] = {"project": "", "supplier": "", "enquirer": "", "date": "", "currency": ""}
-
-            def column_has_empty_currency(df: pd.DataFrame) -> bool:
-                if df is None or "币种" not in df.columns:
-                    return True
-                ser = df["币种"]
-                return ser.map(lambda x: normalize_cell(x) is None).any()
-
-            need_global_currency = column_has_empty_currency(df_for_db)
-
-            st.markdown(t("global_info"))
-            with st.form("global_form_v2"):
-                g1, g2, g3, g4, g5 = st.columns(5)
-                g_project = g1.text_input(t("project_name"), value=st.session_state["bulk_values"].get("project", ""))
-                g_supplier = g2.text_input(t("supplier_name"), value=st.session_state["bulk_values"].get("supplier", ""))
-                g_enquirer = g3.text_input(t("enquirer"), value=st.session_state["bulk_values"].get("enquirer", ""))
-
-                default_date = st.session_state["bulk_values"].get("date", "")
-                try:
-                    g_date = g4.date_input(t("inq_date"), value=pd.to_datetime(default_date).date() if default_date else date.today())
-                except Exception:
-                    g_date = g4.date_input(t("inq_date"), value=date.today())
-
-                g_currency = None
-                if need_global_currency:
-                    currency_options = [""] + CURRENCY_OPTIONS
-                    curr_default = st.session_state["bulk_values"].get("currency", "")
-                    default_idx = currency_options.index(curr_default) if curr_default in currency_options else 0
-                    g_currency = g5.selectbox(t("currency_fill"), currency_options, index=default_idx)
-                else:
-                    g5.write("")
-
-                apply_global = st.form_submit_button(t("apply_global_check"))
-
-            if apply_global:
-                if not (g_project and g_supplier and g_enquirer and g_date):
-                    st.error(t("global_required"))
-                    st.session_state["bulk_applied"] = False
-                elif need_global_currency and (g_currency is None or str(g_currency).strip() == ""):
-                    st.error(t("global_currency_required"))
-                    st.session_state["bulk_applied"] = False
-                else:
-                    st.session_state["bulk_values"] = {
-                        "project": str(g_project),
-                        "supplier": str(g_supplier),
-                        "enquirer": str(g_enquirer),
-                        "date": str(g_date),
-                        "currency": str(g_currency) if g_currency is not None else st.session_state["bulk_values"].get("currency", "")
-                    }
-                    st.session_state["bulk_applied"] = True
-                    st.success(t("global_applied"))
-
-            if st.session_state.get("bulk_applied", False):
-                try:
-                    df_for_db2 = pd.read_csv(io.StringIO(st.session_state["mapping_csv"]), dtype=object)
-                    for c in DB_COLUMNS:
-                        if c not in df_for_db2.columns:
-                            df_for_db2[c] = pd.NA
-                    df_for_db2 = df_for_db2[DB_COLUMNS]
-                except Exception as e:
-                    st.error(t("mapping_restore_fail").format(e))
-                    df_for_db2 = None
-
-                if df_for_db2 is None:
-                    st.error(t("mapping_lost"))
-                else:
-                    df_final = df_for_db2.copy()
-                    g = st.session_state["bulk_values"]
-
-                    def fill_empty(col_name, value):
-                        if col_name not in df_final.columns:
-                            df_final[col_name] = pd.NA
-                        mask = df_final[col_name].map(lambda x: normalize_cell(x) is None)
-                        if mask.any():
-                            df_final.loc[mask, col_name] = value
-
-                    fill_empty("项目名称", str(g["project"]))
-                    fill_empty("供应商名称", str(g["supplier"]))
-                    fill_empty("询价人", str(g["enquirer"]))
-                    fill_empty("询价日期", str(g["date"]))
-                    if need_global_currency and g.get("currency"):
-                        fill_empty("币种", str(g["currency"]))
-
-                    required_nonprice = ["项目名称", "供应商名称", "询价人", "币种", "询价日期"]
-                    check_nonprice = df_final[required_nonprice].map(normalize_cell)
-                    missing_nonprice = check_nonprice.isna().any(axis=1)
-
-                    def price_has_value(row) -> bool:
-                        v1 = normalize_cell(row.get("设备单价", None))
-                        v2 = normalize_cell(row.get("人工包干单价", None))
-                        return (v1 is not None) or (v2 is not None)
-                    def has_name_or_model(row):
-                        name = normalize_cell(row.get("设备材料名称", None))
-                        model = normalize_cell(row.get("规格或型号", None))
-                        return (name is not None) or (model is not None)
-
-                    name_mask = df_final.apply(has_name_or_model, axis=1)
-                    
-                    price_mask = df_final.apply(price_has_value, axis=1)
-                    rows_invalid_mask = missing_nonprice | (~price_mask)| (~name_mask)
-
-                    df_valid = df_final[~rows_invalid_mask].copy()
-                    df_invalid = df_final[rows_invalid_mask].copy()
-
-                    if not df_valid.empty:
-                        try:
-                            df_to_store = df_valid.dropna(how="all").drop_duplicates().reset_index(drop=True)
-                            df_to_store = df_to_store.astype(object)
-                            df_to_store = df_to_store.where(pd.notnull(df_to_store), None)
-                            with engine.begin() as conn:
-                                df_to_store.to_sql("quotations", conn, if_exists="append", index=False, method="multi")
-                            st.success(t("imported_valid").format(len(df_to_store)))
-                        except Exception as e:
-                            st.error(t("import_valid_fail").format(e))
+                for i, raw_col in enumerate(raw_df.columns):
+                    # 来源页 / 来源表只用于追溯，不参与入库字段映射。
+                    if raw_col in ["来源页", "来源表"]:
+                        default = "Ignore"
                     else:
-                        st.info(t("no_valid_records"))
+                        default = ai_mapping.get(raw_col, auto_map_header(raw_col) or "Ignore")
+                        if default not in OCR_MAPPING_COLUMNS:
+                            default = "Ignore"
 
-                    if not df_invalid.empty:
-                        st.warning(t("invalid_rows_warn").format(len(df_invalid)))
-                        safe_st_dataframe(df_invalid.head(50), height=360)
-                        buf_bad = io.BytesIO()
-                        with pd.ExcelWriter(buf_bad, engine="openpyxl") as w:
-                            df_invalid.to_excel(w, index=False)
-                        buf_bad.seek(0)
-                        st.download_button(t("download_invalid"), buf_bad, "invalid_rows.xlsx")
+                    container = cols_left if i % 2 == 0 else cols_right
+                    selected = container.selectbox(
+                        f"OCR列：{raw_col}",
+                        OCR_MAPPING_COLUMNS,
+                        index=OCR_MAPPING_COLUMNS.index(default),
+                        key=f"ocr_ds_map_{i}_{raw_col}"
+                    )
+                    mapped_choices[raw_col] = selected
 
-                    st.session_state["bulk_applied"] = False
+                submit_mapping = st.form_submit_button("应用映射并进入人工修改")
+
+            if submit_mapping:
+                df_mapped = apply_column_mapping_to_raw_df(raw_df, mapped_choices)
+                st.session_state["ocr_mapped_csv"] = df_mapped.to_csv(index=False)
+                st.session_state.pop("ocr_edited_csv", None)
+                st.session_state.pop("ocr_final_csv", None)
+                st.session_state["ocr_ready_for_global"] = False
+                st.success("字段映射已应用。请在下方人工修改识别结果。")
+
+    if st.session_state.get("ocr_mapped_csv"):
+        try:
+            df_for_edit = pd.read_csv(io.StringIO(st.session_state["ocr_mapped_csv"]), dtype=object).fillna("")
+            for col in OCR_EDITABLE_COLUMNS:
+                if col not in df_for_edit.columns:
+                    df_for_edit[col] = ""
+            df_for_edit = df_for_edit[OCR_EDITABLE_COLUMNS]
+        except Exception as e:
+            st.error(f"恢复映射后表格失败：{e}")
+            df_for_edit = pd.DataFrame(columns=OCR_EDITABLE_COLUMNS)
+
+        st.markdown("### 3. 人工修改识别结果")
+        st.warning("请重点核对：设备材料名称、规格或型号、设备单价、人工包干单价、综合单价汇总、小数点、货期和维保期限。")
+
+        edited_df = st.data_editor(
+            df_for_edit,
+            use_container_width=True,
+            num_rows="dynamic",
+            key="ocr_edit_table_after_mapping",
+            height=420,
+        )
+
+        if st.button("保存人工修改，下一步填写全局信息", key="save_ocr_edits_next_global"):
+            st.session_state["ocr_edited_csv"] = edited_df.to_csv(index=False)
+            st.session_state["ocr_ready_for_global"] = True
+            st.session_state.pop("ocr_final_csv", None)
+            st.success("人工修改已保存。请继续填写全局信息。")
+
+    if st.session_state.get("ocr_ready_for_global") and st.session_state.get("ocr_edited_csv"):
+        try:
+            df_edited_saved = pd.read_csv(io.StringIO(st.session_state["ocr_edited_csv"]), dtype=object).fillna("")
+            for col in OCR_EDITABLE_COLUMNS:
+                if col not in df_edited_saved.columns:
+                    df_edited_saved[col] = ""
+            df_edited_saved = df_edited_saved[OCR_EDITABLE_COLUMNS]
+        except Exception as e:
+            st.error(f"恢复人工修改表格失败：{e}")
+            df_edited_saved = pd.DataFrame(columns=OCR_EDITABLE_COLUMNS)
+
+        st.markdown("### 4. 填写全局信息")
+        st.caption("以下 5 项由人工统一填写，并覆盖到每一条报价记录：币种、项目名称、供应商名称、询价日期、询价人。地区自动使用当前登录用户地区。")
+
+        with st.form("ocr_global_info_form", clear_on_submit=False):
+            g1, g2, g3, g4, g5 = st.columns(5)
+            g_currency = g1.selectbox("币种", CURRENCY_OPTIONS, key="ocr_global_currency")
+            g_project = g2.text_input("项目名称", key="ocr_global_project")
+            g_supplier = g3.text_input("供应商名称", key="ocr_global_supplier")
+            g_date = g4.date_input("询价日期", value=date.today(), key="ocr_global_date")
+            g_enquirer = g5.text_input("询价人", key="ocr_global_enquirer")
+            apply_global = st.form_submit_button("应用全局信息并校验")
+
+        if apply_global:
+            if not (g_currency and g_project and g_supplier and g_date and g_enquirer):
+                st.error("请填写：币种、项目名称、供应商名称、询价日期、询价人。")
+            else:
+                df_final = df_edited_saved.copy()
+                df_final["币种"] = str(g_currency)
+                df_final["项目名称"] = str(g_project)
+                df_final["供应商名称"] = str(g_supplier)
+                df_final["询价日期"] = str(g_date)
+                df_final["询价人"] = str(g_enquirer)
+                df_final["地区"] = user["region"]
+
+                for col in DB_COLUMNS:
+                    if col not in df_final.columns:
+                        df_final[col] = ""
+                df_final = df_final[DB_COLUMNS]
+
+                for col in NUMERIC_COLUMNS:
+                    if col in df_final.columns:
+                        df_final[col] = pd.to_numeric(
+                            df_final[col].astype(str).str.replace(",", "", regex=False).str.replace(" ", "", regex=False),
+                            errors="coerce"
+                        )
+
+                st.session_state["ocr_final_csv"] = df_final.to_csv(index=False)
+                st.success("全局信息已应用，请检查校验结果后确认入库。")
+
+    if st.session_state.get("ocr_final_csv"):
+        try:
+            df_final_preview = pd.read_csv(io.StringIO(st.session_state["ocr_final_csv"]), dtype=object)
+            for col in DB_COLUMNS:
+                if col not in df_final_preview.columns:
+                    df_final_preview[col] = pd.NA
+            df_final_preview = df_final_preview[DB_COLUMNS]
+        except Exception as e:
+            st.error(f"恢复最终表格失败：{e}")
+            df_final_preview = pd.DataFrame(columns=DB_COLUMNS)
+
+        st.markdown("### 5. 入库前最终确认")
+        safe_st_dataframe(df_final_preview, height=360)
+
+        c_valid, c_invalid = validate_quotation_df(df_final_preview)
+        cc1, cc2, cc3 = st.columns(3)
+        cc1.metric("可导入记录", len(c_valid))
+        cc2.metric("需修正记录", len(c_invalid))
+        cc3.metric("总记录", len(df_final_preview))
+
+        if not c_invalid.empty:
+            st.markdown("#### 以下记录缺少必填字段或价格字段，暂不能导入")
+            safe_st_dataframe(c_invalid, height=260)
+
+        confirm_import = st.checkbox("我已人工核对 OCR 结果，确认导入有效记录", key="confirm_ocr_import")
+
+        if st.button("确认导入数据库", key="import_ocr_records"):
+            if not confirm_import:
+                st.warning("请先勾选确认框。")
+            elif c_valid.empty:
+                st.warning("没有可导入的有效记录。")
+            else:
+                try:
+                    df_to_store = c_valid.copy()
+                    for col in NUMERIC_COLUMNS:
+                        if col in df_to_store.columns:
+                            df_to_store[col] = pd.to_numeric(df_to_store[col], errors="coerce")
+                    df_to_store = df_to_store.astype(object).where(pd.notnull(df_to_store), None)
+
+                    with engine.begin() as conn:
+                        df_to_store.to_sql("quotations", conn, if_exists="append", index=False, method="multi")
+
+                    st.success(f"✅ 已导入 {len(df_to_store)} 条 OCR 报价记录。")
+                    for k in OCR_STATE_KEYS:
+                        st.session_state.pop(k, None)
+                    safe_rerun()
+                except Exception as e:
+                    st.error(f"导入 OCR 记录失败：{e}")
 
     ui_hr()
     st.header(t("manual_device"))
@@ -1274,41 +2273,60 @@ with nav_tabs[0]:
         pj = col1.text_input(t("project_name"))
         sup = col2.text_input(t("supplier_name"))
         inq = col3.text_input(t("enquirer"))
-        name = st.text_input(t("material_name"))
-        brand = st.text_input(t("brand_optional"))
-        qty = st.number_input(t("qty_confirm"), min_value=0.0)
-        price = st.number_input(t("device_unit_price"), min_value=0.0)
-        labor_price = st.number_input(t("labor_unit_price"), min_value=0.0)
-        cur = st.selectbox(t("currency"), CURRENCY_OPTIONS)
-        desc = st.text_area(t("description"))
+
+        col4, col5, col6 = st.columns(3)
+        name = col4.text_input(t("material_name"))
+        model_spec = col5.text_input("规格或型号")
+        brand = col6.text_input(t("brand_optional"))
+
+        col7, col8, col9, col10 = st.columns(4)
+        price = col7.number_input(t("device_unit_price"), min_value=0.0)
+        labor_price = col8.number_input(t("labor_unit_price"), min_value=0.0)
+        total_price = col9.number_input("综合单价汇总", min_value=0.0)
+        cur = col10.selectbox(t("currency"), CURRENCY_OPTIONS)
+
+        col11, col12 = st.columns(2)
+        warranty = col11.text_input("原厂品牌维保期限")
+        lead_time = col12.text_input("货期")
+
+        remark = st.text_area("备注")
         date_inq = st.date_input(t("inq_date"), value=date.today())
         submit_manual = st.form_submit_button(t("manual_add_btn"))
 
     if submit_manual:
         if not (pj and sup and inq and name):
             st.error(t("manual_required"))
+        elif not (price > 0 or labor_price > 0 or total_price > 0):
+            st.error("请至少填写设备单价、人工包干单价或综合单价汇总中的一项，且大于 0。")
         else:
-            if not (price > 0 or labor_price > 0):
-                st.error(t("manual_price_required"))
-            else:
-                try:
-                    with engine.begin() as conn:
-                        conn.execute(text("""
-                            INSERT INTO quotations
-                            (项目名称,供应商名称,询价人,设备材料名称,品牌,数量确认,设备单价,人工包干单价,币种,描述,录入人,地区,询价日期)
-                            VALUES (:p,:s,:i,:n,:b,:q,:pr,:lp,:c,:d,:u,:reg,:dt)
-                        """), {
-                            "p": pj, "s": sup, "i": inq, "n": name,
-                            "b": brand if brand is not None else "",
-                            "q": float(qty),
-                            "pr": float(price) if price > 0 else None,
-                            "lp": float(labor_price) if labor_price > 0 else None,
-                            "c": cur, "d": desc,
-                            "u": user["username"], "reg": user["region"], "dt": str(date_inq)
-                        })
-                    st.success(t("manual_add_success"))
-                except Exception as e:
-                    st.error(t("manual_add_fail").format(e))
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text("""
+                        INSERT INTO quotations
+                        (项目名称,供应商名称,询价人,设备材料名称,规格或型号,品牌,
+                         设备单价,人工包干单价,综合单价汇总,币种,
+                         原厂品牌维保期限,货期,备注,地区,询价日期)
+                        VALUES (:p,:s,:i,:n,:spec,:b,:pr,:lp,:tp,:c,:w,:lt,:rm,:reg,:dt)
+                    """), {
+                        "p": pj,
+                        "s": sup,
+                        "i": inq,
+                        "n": name,
+                        "spec": model_spec,
+                        "b": brand if brand is not None else "",
+                        "pr": float(price) if price > 0 else None,
+                        "lp": float(labor_price) if labor_price > 0 else None,
+                        "tp": float(total_price) if total_price > 0 else None,
+                        "c": cur,
+                        "w": warranty,
+                        "lt": lead_time,
+                        "rm": remark,
+                        "reg": user["region"],
+                        "dt": str(date_inq)
+                    })
+                st.success(t("manual_add_success"))
+            except Exception as e:
+                st.error(t("manual_add_fail").format(e))
 
     ui_hr()
     st.header(t("manual_misc"))
@@ -1359,7 +2377,7 @@ with nav_tabs[1]:
 
     search_fields = st.multiselect(
         t("search_fields"),
-        ["设备材料名称", "描述", "品牌", "规格或型号", "项目名称", "供应商名称", "地区"],
+        ["设备材料名称", "规格或型号", "品牌", "项目名称", "供应商名称", "备注", "地区"],
         key="search_fields"
     )
     pj_filter = st.text_input(t("filter_project"), key="search_pj")
@@ -1410,7 +2428,7 @@ with nav_tabs[1]:
 
         if kw:
             fields = search_fields if search_fields else [
-                "设备材料名称", "描述", "品牌", "规格或型号", "项目名称", "供应商名称"
+                "设备材料名称", "规格或型号", "品牌", "项目名称", "供应商名称", "备注"
             ]
             search_blob_expr = build_search_blob_expr(fields)
             kw_cond = build_normalized_contains_conditions(search_blob_expr, kw, "kw", params)
@@ -1525,15 +2543,17 @@ with nav_tabs[1]:
                                 with engine.begin() as conn:
                                     conn.execute(text(f"""
                                         INSERT INTO deleted_quotations (
-                                            original_id, 序号, 设备材料名称, 规格或型号, 描述, 品牌, 单位, 数量确认,
-                                            报价品牌, 型号, 设备单价, 设备小计, 人工包干单价, 人工包干小计, 综合单价汇总,
-                                            币种, 原厂品牌维保期限, 货期, 备注, 询价人, 项目名称, 供应商名称, 询价日期, 录入人, 地区,
+                                            original_id, 设备材料名称, 规格或型号, 品牌,
+                                            设备单价, 人工包干单价, 综合单价汇总,
+                                            币种, 原厂品牌维保期限, 货期, 备注,
+                                            询价人, 项目名称, 供应商名称, 询价日期, 地区,
                                             deleted_by
                                         )
                                         SELECT
-                                            id, 序号, 设备材料名称, 规格或型号, 描述, 品牌, 单位, 数量确认,
-                                            报价品牌, 型号, 设备单价, 设备小计, 人工包干单价, 人工包干小计, 综合单价汇总,
-                                            币种, 原厂品牌维保期限, 货期, 备注, 询价人, 项目名称, 供应商名称, 询价日期, 录入人, 地区,
+                                            id, 设备材料名称, 规格或型号, 品牌,
+                                            设备单价, 人工包干单价, 综合单价汇总,
+                                            币种, 原厂品牌维保期限, 货期, 备注,
+                                            询价人, 项目名称, 供应商名称, 询价日期, 地区,
                                             :user
                                         FROM quotations WHERE id IN ({placeholders})
                                     """), {"user": user["username"]})
