@@ -17,6 +17,7 @@ Streamlit Cloud:
         # Optional OCR tuning:
         # DS_OCR2_DPI=220, DS_OCR2_MAX_PAGES=20, DS_OCR2_CONCURRENCY=2
         # DS_OCR2_MAX_TOKENS=8192, DS_OCR2_TIMEOUT=300, DS_OCR2_RETRIES=2
+        # DS_OCR2_DISABLE_PROMPT_CACHE=true
 """
 
 import os
@@ -27,6 +28,7 @@ import base64
 import hashlib
 import html
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 
@@ -40,6 +42,7 @@ from sqlalchemy.pool import NullPool
 
 # ==================== PAGE CONFIG ====================
 st.set_page_config(page_title="CMI Quotation Input & Query Platform", layout="wide")
+APP_RELEASE = "v3.1.0"
 
 
 # ==================== THEME (Wix-like Tech Dark) ====================
@@ -265,11 +268,6 @@ st.markdown(f"<style>{THEME_CSS}</style>", unsafe_allow_html=True)
 
 
 # ==================== I18N ====================
-LANG_OPTIONS = {
-    "中文": "zh",
-    "English": "en"
-}
-
 I18N = {
     "zh": {
         "app_title": "CMI 询价录入与查询平台",
@@ -570,6 +568,181 @@ I18N = {
 }
 
 
+# v3.1：补齐 OCR、手工录入、表格列名及状态信息的完整双语文案。
+# 数据库字段仍使用原中文名称；这里只改变界面显示，不修改表结构和存储值。
+I18N["zh"].update({
+    "app_subtitle": "高科技 · 高效方案 · 快速使用",
+    "ignore": "忽略",
+    "language_zh": "中文",
+    "language_en": "英文",
+    "role": "角色",
+    "role_admin": "管理员",
+    "role_user": "普通用户",
+    "region": "地区",
+    "record_id": "编号",
+    "model_spec": "规格或型号",
+    "brand": "品牌",
+    "quotation_brand": "报价品牌",
+    "model": "型号",
+    "total_unit_price": "综合单价汇总",
+    "warranty": "原厂品牌维保期限",
+    "lead_time": "货期",
+    "remark": "备注",
+    "source_page": "来源页",
+    "source_table": "来源表",
+    "sequence": "序号",
+    "unit": "单位",
+    "device_subtotal": "设备小计",
+    "input_user": "录入人",
+    "sample_count": "样本数",
+    "device_price_avg_col": "设备单价均价",
+    "device_price_min_col": "设备单价最低价",
+    "labor_price_avg_col": "人工包干单价均价",
+    "labor_price_min_col": "人工包干单价最低价",
+    "please_verify": "请核查",
+    "ocr_title": "📄 PDF 报价单 OCR 录入",
+    "ocr_caption": "上传 PDF 报价文件，系统将调用 DeepSeek-OCR-2 识别原始表格并推荐字段映射。最终入库前必须人工确认。",
+    "ocr_upload_pdf": "上传 PDF 报价文件",
+    "ocr_uploaded": "已上传：{}",
+    "ocr_start": "开始 OCR 识别",
+    "ocr_run_caption": "逐页识别并自动重试临时错误；识别结果不会直接入库。",
+    "ocr_processing": "正在调用 DeepSeek-OCR-2 识别 PDF，请稍候……",
+    "ocr_page_failed": "第 {} 页失败，继续处理其他页面……",
+    "ocr_progress": "已完成 {}/{} 页（刚完成第 {} 页）",
+    "ocr_no_table": "OCR 已完成，但没有识别到符合规则的报价明细表。请检查原始识别内容或 PDF 清晰度。",
+    "ocr_completed": "OCR 识别完成，请先检查原始表格和推荐字段映射。",
+    "ocr_failed": "OCR 识别失败：{}",
+    "ocr_view_raw_json": "查看 DeepSeek-OCR-2 原始 JSON",
+    "ocr_restore_raw_failed": "恢复 OCR 原始表格失败：{}",
+    "ocr_raw_table_title": "### 1. OCR 原始识别表格",
+    "ocr_raw_table_caption": "这里显示 DeepSeek-OCR-2 识别出的原始表头和内容；原始文档文字不会被翻译。无法辨认的内容显示为“请核查”。",
+    "ocr_mapping_title": "### 2. 推荐字段映射（可人工修改）",
+    "ocr_mapping_caption": "系统会自动判断每个 OCR 列对应的数据库字段。如映射不正确，请在此修改。",
+    "ocr_column": "OCR 列：{}",
+    "ocr_apply_mapping": "应用映射并进入人工修改",
+    "ocr_mapping_applied": "字段映射已应用，请在下方人工修改识别结果。",
+    "ocr_restore_mapping_failed": "恢复映射后表格失败：{}",
+    "ocr_edit_title": "### 3. 人工修改识别结果",
+    "ocr_edit_warning": "请重点核对：设备材料名称、规格或型号、各类价格、小数点、货期和维保期限。",
+    "ocr_save_edits": "保存人工修改，下一步填写全局信息",
+    "ocr_edits_saved": "人工修改已保存，请继续填写全局信息。",
+    "ocr_restore_edits_failed": "恢复人工修改表格失败：{}",
+    "ocr_global_title": "### 4. 填写全局信息",
+    "ocr_global_caption": "以下 5 项由人工统一填写并覆盖到每条报价记录：币种、项目名称、供应商名称、询价日期、询价人。地区自动使用当前登录用户的地区。",
+    "ocr_apply_global": "应用全局信息并校验",
+    "ocr_global_missing": "请填写：币种、项目名称、供应商名称、询价日期、询价人。",
+    "ocr_global_applied": "全局信息已应用，请检查校验结果后确认入库。",
+    "ocr_restore_final_failed": "恢复最终表格失败：{}",
+    "ocr_final_title": "### 5. 入库前最终确认",
+    "ocr_valid_records": "可导入记录",
+    "ocr_invalid_records": "需修正记录",
+    "ocr_total_records": "总记录",
+    "ocr_invalid_title": "#### 以下记录缺少必填字段或价格字段，暂不能导入",
+    "ocr_confirm_import": "我已人工核对 OCR 结果，确认导入有效记录",
+    "ocr_import_button": "确认导入数据库",
+    "ocr_confirm_first": "请先勾选确认框。",
+    "ocr_no_valid_records": "没有可导入的有效记录。",
+    "ocr_imported": "✅ 已导入 {} 条 OCR 报价记录。",
+    "ocr_import_failed": "导入 OCR 记录失败：{}",
+    "manual_price_required_all": "请至少填写设备单价、人工包干单价或综合单价汇总中的一项，且大于 0。",
+})
+
+I18N["en"].update({
+    "ignore": "Ignore",
+    "language_zh": "Chinese",
+    "language_en": "English",
+    "role": "Role",
+    "role_admin": "Admin",
+    "role_user": "User",
+    "region": "Region",
+    "record_id": "ID",
+    "model_spec": "Specification / Model",
+    "brand": "Brand",
+    "quotation_brand": "Quoted Brand",
+    "model": "Model",
+    "total_unit_price": "Total Unit Price",
+    "warranty": "Original Manufacturer Warranty",
+    "lead_time": "Lead Time",
+    "remark": "Remark",
+    "source_page": "Source Page",
+    "source_table": "Source Table",
+    "sequence": "No.",
+    "unit": "Unit",
+    "device_subtotal": "Device Subtotal",
+    "input_user": "Entered By",
+    "sample_count": "Sample Count",
+    "device_price_avg_col": "Average Device Unit Price",
+    "device_price_min_col": "Minimum Device Unit Price",
+    "labor_price_avg_col": "Average Labor Unit Price",
+    "labor_price_min_col": "Minimum Labor Unit Price",
+    "please_verify": "Please verify",
+    "search_alias_caption": "Supports English keywords, brand aliases, and common abbreviations, e.g. Hikvision / hkvision / HIK.",
+    "ocr_title": "📄 PDF Quotation OCR Import",
+    "ocr_caption": "Upload a PDF quotation. DeepSeek-OCR-2 will extract the original table and recommend field mappings. Manual confirmation is required before database import.",
+    "ocr_upload_pdf": "Upload PDF quotation",
+    "ocr_uploaded": "Uploaded: {}",
+    "ocr_start": "Start OCR",
+    "ocr_run_caption": "Pages are processed individually with automatic retries for temporary errors. Results are not imported automatically.",
+    "ocr_processing": "DeepSeek-OCR-2 is processing the PDF. Please wait…",
+    "ocr_page_failed": "Page {} failed; processing the remaining pages…",
+    "ocr_progress": "Completed {}/{} pages (page {} just finished)",
+    "ocr_no_table": "OCR completed, but no quotation line-item table matching the rules was found. Check the raw output or PDF clarity.",
+    "ocr_completed": "OCR completed. Review the original table and recommended field mappings.",
+    "ocr_failed": "OCR failed: {}",
+    "ocr_view_raw_json": "View raw DeepSeek-OCR-2 JSON",
+    "ocr_restore_raw_failed": "Failed to restore the raw OCR table: {}",
+    "ocr_raw_table_title": "### 1. Raw OCR Table",
+    "ocr_raw_table_caption": "This section shows the original headers and content extracted by DeepSeek-OCR-2. Original document text is not translated. Unreadable content is shown as “Please verify”.",
+    "ocr_mapping_title": "### 2. Recommended Field Mapping (editable)",
+    "ocr_mapping_caption": "The system recommends a database field for each OCR column. Adjust any incorrect mapping here.",
+    "ocr_column": "OCR column: {}",
+    "ocr_apply_mapping": "Apply Mapping and Continue to Manual Review",
+    "ocr_mapping_applied": "Field mapping applied. Review and edit the recognized data below.",
+    "ocr_restore_mapping_failed": "Failed to restore the mapped table: {}",
+    "ocr_edit_title": "### 3. Manually Review OCR Results",
+    "ocr_edit_warning": "Check the item name, specification/model, all price fields, decimal points, lead time, and warranty carefully.",
+    "ocr_save_edits": "Save Manual Edits and Continue",
+    "ocr_edits_saved": "Manual edits saved. Continue with the global information.",
+    "ocr_restore_edits_failed": "Failed to restore the manually edited table: {}",
+    "ocr_global_title": "### 4. Complete Global Information",
+    "ocr_global_caption": "These five values are entered manually and applied to every quotation row: currency, project name, supplier name, enquiry date, and enquirer. Region comes from the current user account.",
+    "ocr_apply_global": "Apply Global Information and Validate",
+    "ocr_global_missing": "Complete Currency, Project Name, Supplier Name, Enquiry Date, and Enquirer.",
+    "ocr_global_applied": "Global information applied. Review validation results before importing.",
+    "ocr_restore_final_failed": "Failed to restore the final table: {}",
+    "ocr_final_title": "### 5. Final Confirmation Before Import",
+    "ocr_valid_records": "Importable Records",
+    "ocr_invalid_records": "Records Requiring Correction",
+    "ocr_total_records": "Total Records",
+    "ocr_invalid_title": "#### The following records are missing required or price fields and cannot be imported",
+    "ocr_confirm_import": "I have manually reviewed the OCR results and confirm importing the valid records",
+    "ocr_import_button": "Import Confirmed Records",
+    "ocr_confirm_first": "Tick the confirmation checkbox first.",
+    "ocr_no_valid_records": "There are no valid records to import.",
+    "ocr_imported": "✅ Imported {} OCR quotation record(s).",
+    "ocr_import_failed": "Failed to import OCR records: {}",
+    "manual_price_required_all": "Enter at least one positive value for Device Unit Price, Labor Lump-Sum Unit Price, or Total Unit Price.",
+})
+
+LANGUAGE_DISPLAY = {
+    "zh": {"zh": "中文", "en": "英文"},
+    "en": {"zh": "Chinese", "en": "English"},
+}
+
+REGION_DISPLAY = {
+    "zh": {
+        "Singapore": "新加坡", "Malaysia": "马来西亚", "Thailand": "泰国",
+        "Indonesia": "印度尼西亚", "Vietnam": "越南", "Philippines": "菲律宾",
+        "Others": "其他", "All": "全部",
+    },
+    "en": {
+        "Singapore": "Singapore", "Malaysia": "Malaysia", "Thailand": "Thailand",
+        "Indonesia": "Indonesia", "Vietnam": "Vietnam", "Philippines": "Philippines",
+        "Others": "Others", "All": "All",
+    },
+}
+
+
 if "lang" not in st.session_state:
     st.session_state["lang"] = "en"
 
@@ -579,16 +752,82 @@ def t(key: str) -> str:
     return I18N.get(lang, I18N["en"]).get(key, key)
 
 
+def current_language() -> str:
+    lang = st.session_state.get("lang", "en")
+    return lang if lang in I18N else "en"
+
+
+def _sync_language_from_widget(key_name: str):
+    selected_lang = st.session_state.get(key_name)
+    if selected_lang in I18N:
+        st.session_state["lang"] = selected_lang
+
+
 def set_language_widget(key_name: str):
-    reverse_map = {v: k for k, v in LANG_OPTIONS.items()}
-    current_display = reverse_map.get(st.session_state.get("lang", "en"), "English")
-    selected = st.selectbox(
+    current_lang = current_language()
+    if st.session_state.get(key_name) not in I18N:
+        st.session_state[key_name] = current_lang
+    st.selectbox(
         t("lang_label"),
-        options=list(LANG_OPTIONS.keys()),
-        index=list(LANG_OPTIONS.keys()).index(current_display),
-        key=key_name
+        options=["zh", "en"],
+        format_func=lambda code: LANGUAGE_DISPLAY[current_lang].get(code, code),
+        key=key_name,
+        on_change=_sync_language_from_widget,
+        args=(key_name,),
     )
-    st.session_state["lang"] = LANG_OPTIONS[selected]
+
+
+def region_display_name(value) -> str:
+    raw_value = "" if value is None else str(value)
+    return REGION_DISPLAY[current_language()].get(raw_value, raw_value)
+
+
+def role_display_name(value) -> str:
+    normalized = "" if value is None else str(value).strip().lower()
+    if normalized == "admin":
+        return t("role_admin")
+    if normalized == "user":
+        return t("role_user")
+    return str(value or "")
+
+
+def localized_ocr_runtime_message(message) -> str:
+    """翻译应用产生的 OCR 诊断文本；服务商返回的技术细节保持原样。"""
+    raw_message = str(message or "")
+    if current_language() == "zh":
+        return raw_message.replace(
+            "OCR result is not valid JSON.",
+            "OCR 结果不是有效的 JSON。",
+        )
+
+    exact_translations = {
+        "上传文件不是有效的 PDF。": "The uploaded file is not a valid PDF.",
+        "暂不支持加密或需要密码的 PDF。": "Encrypted or password-protected PDFs are not supported.",
+        "PDF 没有可识别页面。": "The PDF has no recognizable pages.",
+        "OCR 服务返回空内容。": "The OCR service returned empty content.",
+        "OCR 返回内容中没有有效的 JSON object。": "No valid JSON object was found in the OCR response.",
+        "OCR 服务地址暂未配置，请联系管理员。": "The OCR service URL is not configured. Contact an administrator.",
+        "OCR API 返回为空。": "The OCR API returned an empty response.",
+        "OCR 模型输出出现明显重复循环。": "The OCR model output entered an obvious repetition loop.",
+        "OCR 模型返回了过短且与文档无关的内容，疑似 prompt cache 串扰。": "The OCR model returned an abnormally short and irrelevant response, indicating possible prompt-cache contamination.",
+    }
+    if raw_message in exact_translations:
+        return exact_translations[raw_message]
+
+    translated = raw_message
+    regex_replacements = [
+        (r"^PDF 共 (\d+) 页，超过当前上限 (\d+) 页。$", r"The PDF has \1 pages, exceeding the current limit of \2 pages."),
+        (r"^PDF 打开或渲染失败：(.*)$", r"Failed to open or render the PDF: \1"),
+        (r"^(.+) 没有可发送的图片内容。$", r"\1 contains no image data to send."),
+        (r"^OCR 模型输出达到长度上限并被截断（finish_reason=(.+)）。$", r"The OCR model output reached the length limit and was truncated (finish_reason=\1)."),
+        (r"^OCR API 请求失败（已重试）：(.*)$", r"The OCR API request failed after retries: \1"),
+        (r"^第 (\d+) 页结构化回退解析失败：(.*)$", r"Structured fallback parsing failed on page \1: \2"),
+        (r"^第 (\d+) 页识别失败：(.*)$", r"OCR failed on page \1: \2"),
+        (r"^所有页面 OCR 均失败。(.*)$", r"OCR failed on all pages. \1"),
+    ]
+    for pattern, replacement in regex_replacements:
+        translated = re.sub(pattern, replacement, translated)
+    return translated
 
 
 def ui_card(title: str, subtitle: str = ""):
@@ -663,6 +902,19 @@ def get_float_setting(name: str, default: float, minimum: float, maximum: float)
     return max(minimum, min(value, maximum))
 
 
+def get_bool_setting(name: str, default: bool) -> bool:
+    """读取常见布尔配置写法，无法识别时回落到默认值。"""
+    value = get_secret_or_env(name, default)
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 DS_OCR2_DPI = get_int_setting("DS_OCR2_DPI", 220, 120, 360)
 DS_OCR2_MAX_PAGES = get_int_setting("DS_OCR2_MAX_PAGES", 20, 1, 100)
 DS_OCR2_MAX_IMAGE_SIDE = get_int_setting("DS_OCR2_MAX_IMAGE_SIDE", 3200, 1200, 5000)
@@ -671,6 +923,7 @@ DS_OCR2_TIMEOUT = get_int_setting("DS_OCR2_TIMEOUT", 300, 30, 900)
 DS_OCR2_RETRIES = get_int_setting("DS_OCR2_RETRIES", 2, 0, 5)
 DS_OCR2_CONCURRENCY = get_int_setting("DS_OCR2_CONCURRENCY", 2, 1, 6)
 DS_OCR2_RETRY_BACKOFF = get_float_setting("DS_OCR2_RETRY_BACKOFF", 1.5, 0.2, 10.0)
+DS_OCR2_DISABLE_PROMPT_CACHE = get_bool_setting("DS_OCR2_DISABLE_PROMPT_CACHE", True)
 
 
 # ==================== INIT DB ====================
@@ -780,6 +1033,7 @@ NUMERIC_COLUMNS = ["设备单价", "人工包干单价", "综合单价汇总"]
 REGION_OPTIONS = ["Singapore", "Malaysia", "Thailand", "Indonesia", "Vietnam", "Philippines", "Others"]
 REGION_OPTIONS_ADMIN = ["Singapore", "Malaysia", "Thailand", "Indonesia", "Vietnam", "Philippines", "Others", "All"]
 CURRENCY_OPTIONS = ["IDR", "USD", "RMB", "SGD", "MYR", "THB"]
+ALL_OPTION = "__all__"
 
 OCR_MAPPING_COLUMNS = [
     "Ignore",
@@ -805,6 +1059,48 @@ OCR_EDITABLE_COLUMNS = [
     "货期",
     "备注",
 ]
+
+DISPLAY_COLUMN_KEYS = {
+    "id": "record_id",
+    "username": "username",
+    "role": "role",
+    "region": "region",
+    "序号": "sequence",
+    "设备材料名称": "material_name",
+    "规格或型号": "model_spec",
+    "规格": "model_spec",
+    "型号": "model",
+    "描述": "description",
+    "品牌": "brand",
+    "报价品牌": "quotation_brand",
+    "单位": "unit",
+    "数量确认": "qty_confirm",
+    "数量": "qty_confirm",
+    "设备单价": "device_unit_price",
+    "人工包干单价": "labor_unit_price",
+    "综合单价汇总": "total_unit_price",
+    "设备小计": "device_subtotal",
+    "币种": "currency",
+    "原厂品牌维保期限": "warranty",
+    "货期": "lead_time",
+    "备注": "remark",
+    "询价人": "enquirer",
+    "项目名称": "project_name",
+    "供应商名称": "supplier_name",
+    "询价日期": "inq_date",
+    "地区": "region",
+    "来源页": "source_page",
+    "来源表": "source_table",
+    "杂费类目": "misc_category",
+    "金额": "amount",
+    "录入人": "input_user",
+    "发生日期": "occ_date",
+    "设备单价_均价": "device_price_avg_col",
+    "设备单价_最低": "device_price_min_col",
+    "人工包干单价_均价": "labor_price_avg_col",
+    "人工包干单价_最低": "labor_price_min_col",
+    "样本数": "sample_count",
+}
 
 DS_OCR2_MARKDOWN_PROMPT = """
 <|grounding|>Convert the document to markdown.
@@ -1004,8 +1300,31 @@ def normalize_for_display(df: pd.DataFrame) -> pd.DataFrame:
     return df_disp
 
 
+def display_column_name(column_name) -> str:
+    raw_name = str(column_name)
+    if raw_name == "Ignore":
+        return t("ignore")
+    key = DISPLAY_COLUMN_KEYS.get(raw_name)
+    return t(key) if key else raw_name
+
+
+def localize_dataframe_for_display(df: pd.DataFrame) -> pd.DataFrame:
+    """只翻译界面列名和系统枚举值，不改动底层 DataFrame 或数据库字段。"""
+    if df is None:
+        return df
+    result = df.copy()
+    for column in list(result.columns):
+        if str(column) in {"region", "地区"}:
+            result[column] = result[column].map(region_display_name)
+        elif str(column) == "role":
+            result[column] = result[column].map(role_display_name)
+    if current_language() == "en":
+        result = result.replace({"请核查": t("please_verify")})
+    return result.rename(columns={column: display_column_name(column) for column in result.columns})
+
+
 def safe_st_dataframe(df: pd.DataFrame, height=None):
-    df_disp = normalize_for_display(df)
+    df_disp = localize_dataframe_for_display(normalize_for_display(df))
     if height is None:
         st.dataframe(df_disp, use_container_width=True)
     else:
@@ -1134,6 +1453,68 @@ def normalize_json_values(obj):
     return normalize_unclear_text(obj)
 
 
+class OCRRetryableOutputError(Exception):
+    """模型已响应，但输出截断、循环或疑似缓存串扰，可安全重试。"""
+
+
+def _get_api_finish_reason(data):
+    if not isinstance(data, dict):
+        return None
+    choices = data.get("choices") or []
+    if choices and isinstance(choices[0], dict):
+        return choices[0].get("finish_reason")
+    return data.get("finish_reason")
+
+
+def _looks_like_repetitive_ocr_output(content) -> bool:
+    """识别诸如连续数千次输出 0.00 的模型生成循环。"""
+    if not isinstance(content, str) or len(content) < 500:
+        return False
+
+    normalized_lines = [
+        re.sub(r"\s+", " ", line).strip().lower()
+        for line in content.splitlines()
+        if line.strip()
+    ]
+    if len(normalized_lines) >= 30:
+        _, most_common_count = Counter(normalized_lines).most_common(1)[0]
+        if most_common_count >= max(20, int(len(normalized_lines) * 0.35)):
+            return True
+
+    tokens = re.findall(r"\S+", content.lower())
+    if len(tokens) >= 200:
+        _, most_common_count = Counter(tokens).most_common(1)[0]
+        if most_common_count >= max(50, int(len(tokens) * 0.40)):
+            return True
+    return False
+
+
+def _looks_like_irrelevant_short_ocr_output(content) -> bool:
+    """识别 prompt/KV cache 串扰产生的极短、非文档型回复。"""
+    if not isinstance(content, str):
+        return False
+
+    normalized = re.sub(r"\s+", " ", content).strip()
+    if not normalized or len(normalized) >= 80:
+        return False
+
+    # JSON 回退在没有明细表时允许返回这一短结果。
+    compact = re.sub(r"\s+", "", normalized).lower()
+    if re.fullmatch(r'\{["\']raw_tables["\']:\[\]\}', compact):
+        return False
+
+    document_signals = re.compile(
+        r"quotation|quote|invoice|item|description|specification|qty|quantity|"
+        r"unit|price|amount|total|table|date|payment|delivery|terms|"
+        r"报价|询价|项目|设备|材料|数量|单价|金额|合计|日期|付款|交付|条款",
+        flags=re.IGNORECASE,
+    )
+    structure_signals = ("<table", "</table>", "text[[", "table[[", "sub_title[[", "|")
+    return not document_signals.search(normalized) and not any(
+        signal in normalized.lower() for signal in structure_signals
+    )
+
+
 def _extract_api_response_content(data):
     """兼容常见 OpenAI-compatible、代理商和直接结构化返回。"""
     if not isinstance(data, dict):
@@ -1198,6 +1579,9 @@ def request_deepseek_ocr2(image_bytes: bytes, prompt: str, filename: str = "page
         "model": DS_OCR2_MODEL,
         "temperature": 0,
         "max_tokens": DS_OCR2_MAX_TOKENS,
+        # llama.cpp-compatible 服务默认会复用 KV/prompt cache；视觉 OCR 场景下
+        # 可能跨请求命中错误 slot，必须默认关闭。
+        "cache_prompt": not DS_OCR2_DISABLE_PROMPT_CACHE,
         "messages": [
             {
                 "role": "user",
@@ -1218,6 +1602,14 @@ def request_deepseek_ocr2(image_bytes: bytes, prompt: str, filename: str = "page
     last_error = None
     for attempt in range(DS_OCR2_RETRIES + 1):
         try:
+            effective_prompt = prompt
+            if attempt > 0:
+                effective_prompt = (
+                    f"{prompt}\n"
+                    f"Retry pass {attempt}: output every visible element once only; "
+                    "do not repeat values; stop immediately after the final visible element."
+                )
+            payload["messages"][0]["content"][1]["text"] = effective_prompt
             response = requests.post(
                 DS_OCR2_API_URL,
                 headers=headers,
@@ -1239,10 +1631,26 @@ def request_deepseek_ocr2(image_bytes: bytes, prompt: str, filename: str = "page
             content = _extract_api_response_content(data)
             if content in (None, ""):
                 raise ValueError("OCR API 返回为空。")
+            finish_reason = _get_api_finish_reason(data)
+            if str(finish_reason).lower() in {"length", "max_tokens"}:
+                raise OCRRetryableOutputError(
+                    f"OCR 模型输出达到长度上限并被截断（finish_reason={finish_reason}）。"
+                )
+            if _looks_like_repetitive_ocr_output(content):
+                raise OCRRetryableOutputError("OCR 模型输出出现明显重复循环。")
+            if _looks_like_irrelevant_short_ocr_output(content):
+                raise OCRRetryableOutputError(
+                    "OCR 模型返回了过短且与文档无关的内容，疑似 prompt cache 串扰。"
+                )
             return content
         except ValueError:
             raise
-        except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as exc:
+        except (
+            OCRRetryableOutputError,
+            requests.Timeout,
+            requests.ConnectionError,
+            requests.HTTPError,
+        ) as exc:
             last_error = exc
             if attempt >= DS_OCR2_RETRIES:
                 break
@@ -2004,8 +2412,9 @@ with top_l:
           <div class="title" style="font-size:0.98rem;">{t("current_user")}</div>
           <div class="sub">
             👤 {user["username"]}<br/>
-            🏢 {user["region"]}<br/>
-            🔑 {user["role"]}
+            🏢 {region_display_name(user["region"])}<br/>
+            🔑 {role_display_name(user["role"])}<br/>
+            🧩 {APP_RELEASE}
           </div>
         </div>
         """,
@@ -2022,10 +2431,10 @@ with nav_tabs[0]:
     ui_card(t("input_center"), t("input_center_sub"))
     ui_hr()
 
-    st.header("📄 PDF 报价单 OCR 录入")
-    st.caption("上传 PDF 报价文件，系统会调用 DeepSeek-OCR2 服务识别为原始表格，并给出 AI 推荐字段映射。最终入库前必须人工确认。")
+    st.header(t("ocr_title"))
+    st.caption(t("ocr_caption"))
 
-    uploaded_pdf = st.file_uploader("上传 PDF 报价文件", type=["pdf"], key="upload_pdf_ocr")
+    uploaded_pdf = st.file_uploader(t("ocr_upload_pdf"), type=["pdf"], key="upload_pdf_ocr")
 
     if uploaded_pdf:
         uploaded_pdf_bytes = uploaded_pdf.getvalue()
@@ -2035,11 +2444,11 @@ with nav_tabs[0]:
                 st.session_state.pop(state_key, None)
             st.session_state["ocr_file_fingerprint"] = uploaded_pdf_fingerprint
 
-        st.info(f"已上传：{uploaded_pdf.name}")
+        st.info(t("ocr_uploaded").format(uploaded_pdf.name))
 
         col_ocr_1, col_ocr_2 = st.columns([1, 4])
-        run_ocr = col_ocr_1.button("开始 OCR 识别", key="run_pdf_ocr")
-        col_ocr_2.caption("逐页识别并自动重试临时错误；结果不会直接入库。")
+        run_ocr = col_ocr_1.button(t("ocr_start"), key="run_pdf_ocr")
+        col_ocr_2.caption(t("ocr_run_caption"))
 
         if run_ocr:
             for state_key in OCR_STATE_KEYS:
@@ -2051,12 +2460,12 @@ with nav_tabs[0]:
             def update_ocr_progress(completed, total, page_number, page_error):
                 progress_bar.progress(completed / max(total, 1))
                 if page_error:
-                    progress_status.warning(f"第 {page_number} 页失败，继续处理其他页面……")
+                    progress_status.warning(t("ocr_page_failed").format(page_number))
                 else:
-                    progress_status.caption(f"已完成 {completed}/{total} 页（刚完成第 {page_number} 页）")
+                    progress_status.caption(t("ocr_progress").format(completed, total, page_number))
 
             try:
-                with st.spinner("正在调用 DeepSeek-OCR2 识别 PDF，请稍候..."):
+                with st.spinner(t("ocr_processing")):
                     ocr_json = call_ds_ocr2_for_pdf(
                         uploaded_pdf_bytes,
                         uploaded_pdf.name,
@@ -2067,7 +2476,7 @@ with nav_tabs[0]:
                     st.session_state["ocr_json_raw"] = json.dumps(ocr_json, ensure_ascii=False, indent=2)
 
                     if raw_df.empty:
-                        st.warning("OCR 已完成，但没有识别到符合规则的报价明细表。请检查原始识别内容或 PDF 清晰度。")
+                        st.warning(t("ocr_no_table"))
                     else:
                         st.session_state["ocr_raw_df_csv"] = raw_df.to_csv(index=False)
                         st.session_state["ocr_ai_mapping_json"] = json.dumps(ai_mapping, ensure_ascii=False)
@@ -2075,24 +2484,24 @@ with nav_tabs[0]:
                         st.session_state.pop("ocr_edited_csv", None)
                         st.session_state.pop("ocr_final_csv", None)
                         st.session_state["ocr_ready_for_global"] = False
-                        st.success("OCR 识别完成，请先检查原始表格和 AI 推荐字段映射。")
+                        st.success(t("ocr_completed"))
                     for warning_message in ocr_json.get("warnings", []):
-                        st.warning(warning_message)
+                        st.warning(localized_ocr_runtime_message(warning_message))
             except Exception as e:
-                st.error(f"OCR 识别失败：{e}")
+                st.error(t("ocr_failed").format(localized_ocr_runtime_message(e)))
             finally:
                 progress_bar.empty()
                 progress_status.empty()
 
     if st.session_state.get("ocr_json_raw"):
-        with st.expander("查看 DeepSeek-OCR2 原始 JSON", expanded=False):
+        with st.expander(t("ocr_view_raw_json"), expanded=False):
             st.code(st.session_state["ocr_json_raw"], language="json")
 
     if st.session_state.get("ocr_raw_df_csv"):
         try:
             raw_df = pd.read_csv(io.StringIO(st.session_state["ocr_raw_df_csv"]), dtype=object).fillna("")
         except Exception as e:
-            st.error(f"恢复 OCR 原始表格失败：{e}")
+            st.error(t("ocr_restore_raw_failed").format(e))
             raw_df = pd.DataFrame()
 
         try:
@@ -2101,12 +2510,12 @@ with nav_tabs[0]:
             ai_mapping = {}
 
         if not raw_df.empty:
-            st.markdown("### 1. OCR 原始识别表格")
-            st.caption("这里显示 DeepSeek-OCR2 识别出的原始表头和原始内容。看不清的内容会显示为：请核查。")
+            st.markdown(t("ocr_raw_table_title"))
+            st.caption(t("ocr_raw_table_caption"))
             safe_st_dataframe(raw_df, height=360)
 
-            st.markdown("### 2. AI 推荐字段映射，可人工修改")
-            st.caption("AI 会先自动猜测每个 OCR column 对应哪个数据库字段。如果不对，可以手动改。")
+            st.markdown(t("ocr_mapping_title"))
+            st.caption(t("ocr_mapping_caption"))
 
             mapped_choices = {}
             with st.form("ocr_ai_mapping_form", clear_on_submit=False):
@@ -2122,14 +2531,15 @@ with nav_tabs[0]:
 
                     container = cols_left if i % 2 == 0 else cols_right
                     selected = container.selectbox(
-                        f"OCR列：{raw_col}",
+                        t("ocr_column").format(display_column_name(raw_col)),
                         OCR_MAPPING_COLUMNS,
                         index=OCR_MAPPING_COLUMNS.index(default),
-                        key=f"ocr_ds_map_{i}_{raw_col}"
+                        key=f"ocr_ds_map_{i}_{raw_col}",
+                        format_func=display_column_name,
                     )
                     mapped_choices[raw_col] = selected
 
-                submit_mapping = st.form_submit_button("应用映射并进入人工修改")
+                submit_mapping = st.form_submit_button(t("ocr_apply_mapping"))
 
             if submit_mapping:
                 df_mapped = apply_column_mapping_to_raw_df(raw_df, mapped_choices)
@@ -2137,7 +2547,7 @@ with nav_tabs[0]:
                 st.session_state.pop("ocr_edited_csv", None)
                 st.session_state.pop("ocr_final_csv", None)
                 st.session_state["ocr_ready_for_global"] = False
-                st.success("字段映射已应用。请在下方人工修改识别结果。")
+                st.success(t("ocr_mapping_applied"))
 
     if st.session_state.get("ocr_mapped_csv"):
         try:
@@ -2147,25 +2557,36 @@ with nav_tabs[0]:
                     df_for_edit[col] = ""
             df_for_edit = df_for_edit[OCR_EDITABLE_COLUMNS]
         except Exception as e:
-            st.error(f"恢复映射后表格失败：{e}")
+            st.error(t("ocr_restore_mapping_failed").format(e))
             df_for_edit = pd.DataFrame(columns=OCR_EDITABLE_COLUMNS)
 
-        st.markdown("### 3. 人工修改识别结果")
-        st.warning("请重点核对：设备材料名称、规格或型号、设备单价、人工包干单价、综合单价汇总、小数点、货期和维保期限。")
+        st.markdown(t("ocr_edit_title"))
+        st.warning(t("ocr_edit_warning"))
 
-        edited_df = st.data_editor(
-            df_for_edit,
+        df_for_editor = df_for_edit.copy()
+        if current_language() == "en":
+            df_for_editor = df_for_editor.replace({"请核查": t("please_verify")})
+
+        edited_df_display = st.data_editor(
+            df_for_editor,
             use_container_width=True,
             num_rows="dynamic",
             key="ocr_edit_table_after_mapping",
             height=420,
+            column_config={
+                column: st.column_config.TextColumn(display_column_name(column))
+                for column in df_for_editor.columns
+            },
         )
+        edited_df = edited_df_display.copy()
+        if current_language() == "en":
+            edited_df = edited_df.replace({t("please_verify"): "请核查"})
 
-        if st.button("保存人工修改，下一步填写全局信息", key="save_ocr_edits_next_global"):
+        if st.button(t("ocr_save_edits"), key="save_ocr_edits_next_global"):
             st.session_state["ocr_edited_csv"] = edited_df.to_csv(index=False)
             st.session_state["ocr_ready_for_global"] = True
             st.session_state.pop("ocr_final_csv", None)
-            st.success("人工修改已保存。请继续填写全局信息。")
+            st.success(t("ocr_edits_saved"))
 
     if st.session_state.get("ocr_ready_for_global") and st.session_state.get("ocr_edited_csv"):
         try:
@@ -2175,24 +2596,24 @@ with nav_tabs[0]:
                     df_edited_saved[col] = ""
             df_edited_saved = df_edited_saved[OCR_EDITABLE_COLUMNS]
         except Exception as e:
-            st.error(f"恢复人工修改表格失败：{e}")
+            st.error(t("ocr_restore_edits_failed").format(e))
             df_edited_saved = pd.DataFrame(columns=OCR_EDITABLE_COLUMNS)
 
-        st.markdown("### 4. 填写全局信息")
-        st.caption("以下 5 项由人工统一填写，并覆盖到每一条报价记录：币种、项目名称、供应商名称、询价日期、询价人。地区自动使用当前登录用户地区。")
+        st.markdown(t("ocr_global_title"))
+        st.caption(t("ocr_global_caption"))
 
         with st.form("ocr_global_info_form", clear_on_submit=False):
             g1, g2, g3, g4, g5 = st.columns(5)
-            g_currency = g1.selectbox("币种", CURRENCY_OPTIONS, key="ocr_global_currency")
-            g_project = g2.text_input("项目名称", key="ocr_global_project")
-            g_supplier = g3.text_input("供应商名称", key="ocr_global_supplier")
-            g_date = g4.date_input("询价日期", value=date.today(), key="ocr_global_date")
-            g_enquirer = g5.text_input("询价人", key="ocr_global_enquirer")
-            apply_global = st.form_submit_button("应用全局信息并校验")
+            g_currency = g1.selectbox(t("currency"), CURRENCY_OPTIONS, key="ocr_global_currency")
+            g_project = g2.text_input(t("project_name"), key="ocr_global_project")
+            g_supplier = g3.text_input(t("supplier_name"), key="ocr_global_supplier")
+            g_date = g4.date_input(t("inq_date"), value=date.today(), key="ocr_global_date")
+            g_enquirer = g5.text_input(t("enquirer"), key="ocr_global_enquirer")
+            apply_global = st.form_submit_button(t("ocr_apply_global"))
 
         if apply_global:
             if not (g_currency and g_project and g_supplier and g_date and g_enquirer):
-                st.error("请填写：币种、项目名称、供应商名称、询价日期、询价人。")
+                st.error(t("ocr_global_missing"))
             else:
                 df_final = df_edited_saved.copy()
                 df_final["币种"] = str(g_currency)
@@ -2215,7 +2636,7 @@ with nav_tabs[0]:
                         )
 
                 st.session_state["ocr_final_csv"] = df_final.to_csv(index=False)
-                st.success("全局信息已应用，请检查校验结果后确认入库。")
+                st.success(t("ocr_global_applied"))
 
     if st.session_state.get("ocr_final_csv"):
         try:
@@ -2225,29 +2646,29 @@ with nav_tabs[0]:
                     df_final_preview[col] = pd.NA
             df_final_preview = df_final_preview[DB_COLUMNS]
         except Exception as e:
-            st.error(f"恢复最终表格失败：{e}")
+            st.error(t("ocr_restore_final_failed").format(e))
             df_final_preview = pd.DataFrame(columns=DB_COLUMNS)
 
-        st.markdown("### 5. 入库前最终确认")
+        st.markdown(t("ocr_final_title"))
         safe_st_dataframe(df_final_preview, height=360)
 
         c_valid, c_invalid = validate_quotation_df(df_final_preview)
         cc1, cc2, cc3 = st.columns(3)
-        cc1.metric("可导入记录", len(c_valid))
-        cc2.metric("需修正记录", len(c_invalid))
-        cc3.metric("总记录", len(df_final_preview))
+        cc1.metric(t("ocr_valid_records"), len(c_valid))
+        cc2.metric(t("ocr_invalid_records"), len(c_invalid))
+        cc3.metric(t("ocr_total_records"), len(df_final_preview))
 
         if not c_invalid.empty:
-            st.markdown("#### 以下记录缺少必填字段或价格字段，暂不能导入")
+            st.markdown(t("ocr_invalid_title"))
             safe_st_dataframe(c_invalid, height=260)
 
-        confirm_import = st.checkbox("我已人工核对 OCR 结果，确认导入有效记录", key="confirm_ocr_import")
+        confirm_import = st.checkbox(t("ocr_confirm_import"), key="confirm_ocr_import")
 
-        if st.button("确认导入数据库", key="import_ocr_records"):
+        if st.button(t("ocr_import_button"), key="import_ocr_records"):
             if not confirm_import:
-                st.warning("请先勾选确认框。")
+                st.warning(t("ocr_confirm_first"))
             elif c_valid.empty:
-                st.warning("没有可导入的有效记录。")
+                st.warning(t("ocr_no_valid_records"))
             else:
                 try:
                     df_to_store = c_valid.copy()
@@ -2259,12 +2680,12 @@ with nav_tabs[0]:
                     with engine.begin() as conn:
                         df_to_store.to_sql("quotations", conn, if_exists="append", index=False, method="multi")
 
-                    st.success(f"✅ 已导入 {len(df_to_store)} 条 OCR 报价记录。")
+                    st.success(t("ocr_imported").format(len(df_to_store)))
                     for k in OCR_STATE_KEYS:
                         st.session_state.pop(k, None)
                     safe_rerun()
                 except Exception as e:
-                    st.error(f"导入 OCR 记录失败：{e}")
+                    st.error(t("ocr_import_failed").format(e))
 
     ui_hr()
     st.header(t("manual_device"))
@@ -2276,20 +2697,20 @@ with nav_tabs[0]:
 
         col4, col5, col6 = st.columns(3)
         name = col4.text_input(t("material_name"))
-        model_spec = col5.text_input("规格或型号")
+        model_spec = col5.text_input(t("model_spec"))
         brand = col6.text_input(t("brand_optional"))
 
         col7, col8, col9, col10 = st.columns(4)
         price = col7.number_input(t("device_unit_price"), min_value=0.0)
         labor_price = col8.number_input(t("labor_unit_price"), min_value=0.0)
-        total_price = col9.number_input("综合单价汇总", min_value=0.0)
+        total_price = col9.number_input(t("total_unit_price"), min_value=0.0)
         cur = col10.selectbox(t("currency"), CURRENCY_OPTIONS)
 
         col11, col12 = st.columns(2)
-        warranty = col11.text_input("原厂品牌维保期限")
-        lead_time = col12.text_input("货期")
+        warranty = col11.text_input(t("warranty"))
+        lead_time = col12.text_input(t("lead_time"))
 
-        remark = st.text_area("备注")
+        remark = st.text_area(t("remark"))
         date_inq = st.date_input(t("inq_date"), value=date.today())
         submit_manual = st.form_submit_button(t("manual_add_btn"))
 
@@ -2297,7 +2718,7 @@ with nav_tabs[0]:
         if not (pj and sup and inq and name):
             st.error(t("manual_required"))
         elif not (price > 0 or labor_price > 0 or total_price > 0):
-            st.error("请至少填写设备单价、人工包干单价或综合单价汇总中的一项，且大于 0。")
+            st.error(t("manual_price_required_all"))
         else:
             try:
                 with engine.begin() as conn:
@@ -2378,18 +2799,31 @@ with nav_tabs[1]:
     search_fields = st.multiselect(
         t("search_fields"),
         ["设备材料名称", "规格或型号", "品牌", "项目名称", "供应商名称", "备注", "地区"],
-        key="search_fields"
+        key="search_fields",
+        format_func=display_column_name,
     )
     pj_filter = st.text_input(t("filter_project"), key="search_pj")
     sup_filter = st.text_input(t("filter_supplier"), key="search_sup")
     brand_filter = st.text_input(t("filter_brand"), key="search_brand")
-    cur_filter = st.selectbox(t("currency"), [t("all")] + CURRENCY_OPTIONS, index=0, key="search_cur")
+    cur_filter = st.selectbox(
+        t("currency"),
+        [ALL_OPTION] + CURRENCY_OPTIONS,
+        index=0,
+        key="search_cur",
+        format_func=lambda value: t("all") if value == ALL_OPTION else value,
+    )
 
-    regions_options = [t("all")] + REGION_OPTIONS_ADMIN
+    regions_options = [ALL_OPTION] + REGION_OPTIONS
     if user["role"] == "admin":
-        region_filter = st.selectbox(t("filter_region_admin"), regions_options, index=0, key="search_region")
+        region_filter = st.selectbox(
+            t("filter_region_admin"),
+            regions_options,
+            index=0,
+            key="search_region",
+            format_func=lambda value: t("all") if value == ALL_OPTION else region_display_name(value),
+        )
     else:
-        st.info(t("only_region_data").format(user["region"]))
+        st.info(t("only_region_data").format(region_display_name(user["region"])))
         region_filter = user["region"]
 
     if st.button(t("search_device_btn"), key="search_button"):
@@ -2400,7 +2834,7 @@ with nav_tabs[1]:
             conds.append("地区 = :r")
             params["r"] = user["region"]
         else:
-            if region_filter and region_filter != t("all"):
+            if region_filter and region_filter != ALL_OPTION:
                 conds.append("地区 = :r")
                 params["r"] = region_filter
 
@@ -2422,7 +2856,7 @@ with nav_tabs[1]:
             if brand_cond:
                 conds.append(brand_cond)
 
-        if cur_filter != t("all"):
+        if cur_filter != ALL_OPTION:
             conds.append("币种 = :cur")
             params["cur"] = cur_filter
 
@@ -2619,7 +3053,12 @@ if user["role"] == "admin":
             c1, c2, c3 = st.columns(3)
             new_user = c1.text_input(t("admin_create_username"), key="admin_create_username_input")
             new_pass = c2.text_input(t("admin_create_password"), type="password", key="admin_create_password_input")
-            new_region_create = c3.selectbox(t("admin_create_region"), REGION_OPTIONS, key="admin_create_region_select")
+            new_region_create = c3.selectbox(
+                t("admin_create_region"),
+                REGION_OPTIONS,
+                key="admin_create_region_select",
+                format_func=region_display_name,
+            )
             confirm_create = st.checkbox(t("admin_create_confirm"), key="admin_create_confirm_check")
             submit_create = st.form_submit_button(t("admin_create_btn"))
 
@@ -2636,7 +3075,7 @@ if user["role"] == "admin":
                             text("INSERT INTO users (username,password,role,region) VALUES (:u,:p,'user',:r)"),
                             {"u": new_user, "p": pw_hash, "r": new_region_create}
                         )
-                    st.success(t("admin_create_success").format(new_user, new_region_create))
+                    st.success(t("admin_create_success").format(new_user, region_display_name(new_region_create)))
                     safe_rerun()
                 except Exception:
                     st.error(t("admin_create_fail"))
@@ -2645,11 +3084,19 @@ if user["role"] == "admin":
         st.subheader(t("update_region_title"))
 
         region_options = REGION_OPTIONS_ADMIN
-        user_choices = [f"{row['id']} | {row['username']} | {row['role']} | {row['region']}" for _, row in users_df.iterrows()]
+        user_choices = [
+            f"{row['id']} | {row['username']} | {role_display_name(row['role'])} | {region_display_name(row['region'])}"
+            for _, row in users_df.iterrows()
+        ]
 
         with st.form("admin_update_user_region_form"):
             target = st.selectbox(t("select_user_update"), user_choices, key="admin_update_user_select")
-            new_region = st.selectbox(t("new_region"), region_options, key="admin_update_user_region")
+            new_region = st.selectbox(
+                t("new_region"),
+                region_options,
+                key="admin_update_user_region",
+                format_func=region_display_name,
+            )
             confirm_update = st.checkbox(t("confirm_update_region"), key="admin_update_user_confirm")
             submit_update = st.form_submit_button(t("update_region_btn"))
 
@@ -2670,7 +3117,7 @@ if user["role"] == "admin":
                     else:
                         with engine.begin() as conn:
                             conn.execute(text("UPDATE users SET region=:r WHERE id=:id"), {"r": new_region, "id": target_id})
-                        st.success(t("update_region_success").format(target_username, new_region))
+                        st.success(t("update_region_success").format(target_username, region_display_name(new_region)))
                         safe_rerun()
             except Exception as e:
                 st.error(t("update_fail").format(e))
@@ -2685,7 +3132,10 @@ if user["role"] == "admin":
         if deletable_rows.empty:
             st.info(t("no_deletable_user"))
         else:
-            del_choices = [f"{row['id']} | {row['username']} | {row['role']} | {row['region']}" for _, row in deletable_rows.iterrows()]
+            del_choices = [
+                f"{row['id']} | {row['username']} | {role_display_name(row['role'])} | {region_display_name(row['region'])}"
+                for _, row in deletable_rows.iterrows()
+            ]
 
             with st.form("admin_delete_users_form"):
                 selected = st.multiselect(t("select_delete_user"), del_choices, key="admin_delete_users_select")
