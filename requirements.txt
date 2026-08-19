@@ -5,3 +5,4 @@ openpyxl
 psycopg2-binary
 openpyxl
 requests
+PyMuPDF>=1.24.0
